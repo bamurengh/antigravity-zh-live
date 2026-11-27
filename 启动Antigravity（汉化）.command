@@ -13,7 +13,7 @@ APP="Antigravity"
 PORT_FILE="$HOME/Library/Application Support/Antigravity/DevToolsActivePort"
 
 if pgrep -x "$APP" >/dev/null 2>&1; then
-  if pgrep -fl "/Applications/Antigravity.app/Contents/MacOS/Antigravity .*--remote-debugging-port" >/dev/null 2>&1; then
+  if pgrep -fl "Antigravity\.app/Contents/MacOS/Antigravity .*--remote-debugging-port" >/dev/null 2>&1; then
     echo "✓ Antigravity 已在汉化模式下运行，无需重启。"
     exit 0
   fi

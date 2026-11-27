@@ -59,6 +59,7 @@
   var dict = {};
   var dictLower = {};
   var dictKeys = [];
+  var singleWordBuckets = {};  // 按首字符分桶的不含空格词条（按长度降序），加速 matchRun
   (function buildDict() {
     for (var k in DICT) {
       if (!Object.prototype.hasOwnProperty.call(DICT, k)) continue;
@@ -80,6 +81,14 @@
         var kl = kk.toLowerCase();
         if (!Object.prototype.hasOwnProperty.call(dictLower, kl)) dictLower[kl] = v;
       }
+      if (kk.indexOf(' ') === -1) {
+        var ch0 = kk.charAt(0);
+        if (!singleWordBuckets[ch0]) singleWordBuckets[ch0] = [];
+        singleWordBuckets[ch0].push(kk);
+      }
+    }
+    for (var ch in singleWordBuckets) {
+      singleWordBuckets[ch].sort(function(a, b) { return b.length - a.length; });
     }
     dictKeys = Object.keys(dict);
   })();
@@ -88,8 +97,10 @@
   try { window.__agy_dict = dict; } catch (e) {}
 
   // ====== 常量 ======
-  var ENGINE_VERSION = '2026.11.26.18';  // 引擎版本：语义变化时递增，供注入器判断是否需要热替换
+  var ENGINE_VERSION = '0.3.2';          // 引擎版本：语义变化时递增，供注入器判断是否需要热替换
   var DICT_SIG = '%%DICT_SIG%%';         // 词典签名：词典热重载时变更，供注入器判断热替换
+  var INIT_ZH = '%%INIT_ZH%%' !== 'false';
+  var INIT_HUD = '%%INIT_HUD%%' !== 'false';
   var MARK = typeof Symbol === 'function' ? Symbol('zh') : '__zh_mark__';
   var TR_ATTRS = ['placeholder', 'title', 'aria-label', 'data-tooltip'];
   // 极短高歧义词：只有作为元素内唯一文本（不含相邻拆句节点、不带前后空格拼接）时才允许翻译，
@@ -141,16 +152,25 @@
    * 关键：tail 必须原样返回，否则严格模式无法发现"中英混杂"。
    */
   function matchRun(text) {
+    // 快路径：O(1) 哈希精确命中整个英文词片段
+    if (Object.prototype.hasOwnProperty.call(dict, text)) {
+      return { text: dict[text], tail: '' };
+    }
     var produced = '', tail = '', i = 0, guard = 0;
     while (i < text.length && guard++ < 128) {
       var best = null;
-      for (var j = 0; j < dictKeys.length; j++) {
-        var k = dictKeys[j];
-        if (k.length > text.length - i) continue;
-        if (text.substr(i, k.length) !== k) continue;
-        var after = text.charAt(i + k.length);
-        if (after && /[A-Za-z0-9]/.test(after)) continue;   // 必须在词边界结束
-        if (!best || k.length > best.length) best = k;
+      var bucket = singleWordBuckets[text.charAt(i)];
+      if (bucket) {
+        var rem = text.length - i;
+        for (var j = 0; j < bucket.length; j++) {
+          var k = bucket[j];
+          if (k.length > rem) continue;
+          if (text.substr(i, k.length) !== k) continue;
+          var after = text.charAt(i + k.length);
+          if (after && /[A-Za-z0-9]/.test(after)) continue;   // 必须在词边界结束
+          best = k;                                           // 已按长度降序，首个命中即最长
+          break;
+        }
       }
       if (best) { produced += dict[best]; i += best.length; }
       else {
@@ -161,8 +181,6 @@
     }
     return { text: produced, tail: tail };
   }
-
-  var SEG_CJK = /[\u4e00-\u9fa5\d]/;
 
   /**
    * 整串翻译：按「英文片段 / 前导分隔符」配对处理。
@@ -557,6 +575,7 @@
     var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
     var n, fixed = 0;
     while ((n = walker.nextNode())) {
+      if (isSkippableParent(n.parentElement)) continue;
       var t = n.textContent || '';
       if (t.indexOf(' ') === -1 && t.indexOf('\t') === -1 && t.indexOf('\u00a0') === -1) continue;
       var nv = t.replace(CJK_SPACE_RE, '$1');
@@ -590,18 +609,31 @@
     }
   }
 
-  // ====== 批量队列：空闲时处理，不阻塞 UI ======
-  var pending = [], scheduled = false;
+  // ====== 批量队列：Set 去重 + 空闲分批处理，不阻塞 UI ======
+  var pending = [], pendingSet = (typeof Set === 'function') ? new Set() : null, scheduled = false;
 
   function flush() {
     scheduled = false;
     var batch = pending;
     pending = [];
+    if (pendingSet) pendingSet.clear();
     var deadline = Date.now() + CFG.budgetMs;
     for (var i = 0; i < batch.length; i++) {
       if (window.__agy_zh_enabled === false) return;
-      if (Date.now() > deadline) { pending = batch.slice(i).concat(pending); schedule(); syncStats(); return; }
-      walkAndTranslate(batch[i], deadline);
+      var node = batch[i];
+      if (!node || (node.isConnected === false)) continue;
+      if (Date.now() > deadline) {
+        for (var r = i; r < batch.length; r++) {
+          if (batch[r] && (!pendingSet || !pendingSet.has(batch[r]))) {
+            pending.push(batch[r]);
+            if (pendingSet) pendingSet.add(batch[r]);
+          }
+        }
+        schedule();
+        syncStats();
+        return;
+      }
+      walkAndTranslate(node, deadline);
     }
     syncStats();
   }
@@ -614,6 +646,12 @@
     flush();
   }
   function enqueue(node) {
+    if (!node) return;
+    if (pendingSet) {
+      if (pendingSet.has(node)) return;
+      if (node.parentNode && pendingSet.has(node.parentNode)) return;
+      pendingSet.add(node);
+    }
     if (pending.length > 5000) { walkAndTranslate(node, Date.now() + CFG.budgetMs); return; }
     pending.push(node);
     schedule();
@@ -647,11 +685,15 @@
   var hudLastRouteId = undefined;
   var hudExpanded = false;
   var hudCapOverride = 0; // 0 = 自动
-  var hudEnabled = true;
-  var hudThemeTimer = null;
+  var hudEnabled = INIT_HUD;
+  var hudThemeObserver = null;
   var hudStreamTimer = null;
   var hudRemountTimer = null;
   var hudResizeHandler = null;
+  var hudResizeObserver = null;
+  var hudObservedRow = null;
+  var hudAvailWidth = 999;
+  var lastHudRenderKey = '';
   var hudDocClickHandler = null;
   var hudKeyHandler = null;
   var hudVisHandler = null;
@@ -659,6 +701,7 @@
   var isRestoring = false;
   var domDirty = true;
   var lastRescanAt = 0;
+  var lastPruneAt = 0;
 
   // DOM 流式输出实时测速状态
   var streamEvents = []; // [{t, tok}]
@@ -667,10 +710,16 @@
   var streamLastTps = null;
   var streamEmaTps = null;
   var streamLastAt = 0;
-  var streamBaselineUpdatedAt = 0;
   var streamWasWorking = false;
-  var tempIdleTps = null;
   var domWorkCache = { ts: 0, val: false };
+
+  function escapeHtml(s) {
+    return String(s === null || s === undefined ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
 
   function loadStorage(key, fallback) {
     try {
@@ -714,8 +763,12 @@
 
   function estimateTokensFromText(txt) {
     if (!txt) return 0;
-    var cjk = (txt.match(/[\u4e00-\u9fa5]/g) || []).length;
-    var rest = Math.max(0, txt.length - cjk);
+    var len = txt.length, cjk = 0;
+    for (var i = 0; i < len; i++) {
+      var code = txt.charCodeAt(i);
+      if (code >= 0x4e00 && code <= 0x9fa5) cjk++;
+    }
+    var rest = len - cjk;
     return cjk * 0.67 + rest * 0.25;
   }
 
@@ -812,6 +865,8 @@
         var nd = mu.addedNodes[i];
         if (!nd) continue;
         if (nd.id === '__agy_metrics_host') continue;
+        // 跳过复杂大容器，避免在高频流式渲染期拼接整棵子树 textContent
+        if (nd.nodeType === 1 && nd.childNodes && nd.childNodes.length > 4) continue;
         var parentEl = nd.nodeType === 1 ? nd : nd.parentElement;
         if (!isInMainChatArea(parentEl)) continue;
         var txt = nd.textContent || '';
@@ -843,6 +898,7 @@
       if (recentCount >= 2 && (now - streamEvents[0].t) >= 250) {
         streamActive = true;
       }
+      startStreamTimer();
     }
   }
 
@@ -884,9 +940,7 @@
     streamLastTps = null;
     streamEmaTps = null;
     streamLastAt = 0;
-    streamBaselineUpdatedAt = 0;
     streamWasWorking = false;
-    tempIdleTps = null;
   }
 
   function syncRouteChange() {
@@ -900,7 +954,19 @@
     return false;
   }
 
+  function startStreamTimer() {
+    if (hudStreamTimer || typeof setInterval !== 'function') return;
+    hudStreamTimer = setInterval(updateStreamSpeed, 250);
+  }
+
+  function stopStreamTimer() {
+    if (!hudStreamTimer) return;
+    try { clearInterval(hudStreamTimer); } catch (e) {}
+    hudStreamTimer = null;
+  }
+
   function updateStreamSpeed() {
+    if (document.hidden) return;
     var routeChanged = syncRouteChange();
     var now = Date.now();
     var m = pickActiveConversation(hudPayload);
@@ -915,7 +981,6 @@
       streamLastTps = null;
       streamEvents = [];
       streamActive = false;
-      tempIdleTps = null;
     } else if (streamWasWorking && !isWorking) {
       streamActive = false;
       streamLastTps = null;
@@ -926,7 +991,13 @@
     streamWasWorking = isWorking;
 
     if (!streamActive) {
-      if (isWorking) renderHud();
+      if (isWorking) {
+        renderHud();
+      } else if (!streamEvents.length || (now - streamLastAt) > 2200) {
+        // 回归空闲：彻底停止 250ms 定时器，空闲时 0 唤醒
+        streamEvents = [];
+        stopStreamTimer();
+      }
       return;
     }
     if (now - streamLastAt > 2000) {
@@ -935,6 +1006,7 @@
       streamEmaTps = null;
       streamEvents = [];
       renderHud();
+      if (!isWorking) stopStreamTimer();
       return;
     }
     while (streamEvents.length && now - streamEvents[0].t > 2500) streamEvents.shift();
@@ -988,6 +1060,47 @@
     return true;
   }
 
+  function isOverlayEl(el) {
+    if (!el || el.nodeType !== 1) return true;
+    var role = el.getAttribute ? el.getAttribute('role') : '';
+    if (role === 'menu' || role === 'listbox' || role === 'dialog' || role === 'tooltip' || role === 'presentation') return true;
+    if (el.hasAttribute && (el.hasAttribute('data-radix-popper-content-wrapper') || el.hasAttribute('data-floating-ui-portal'))) return true;
+    try {
+      if (window.getComputedStyle) {
+        var st = window.getComputedStyle(el);
+        if (st && (st.position === 'fixed' || st.position === 'absolute' || st.display === 'none')) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function isHorizontalFlexRow(el) {
+    if (!el || el.nodeType !== 1 || !window.getComputedStyle) return false;
+    try {
+      var st = window.getComputedStyle(el);
+      if (!st) return false;
+      if (st.display !== 'flex' && st.display !== 'inline-flex') return false;
+      if (st.flexDirection && st.flexDirection.indexOf('column') !== -1) return false;
+      var h = el.getBoundingClientRect ? el.getBoundingClientRect().height : 0;
+      if (h > 84) return false;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function countFlowChildren(el) {
+    var count = 0;
+    var ch = el.children || el.childNodes || [];
+    for (var c = 0; c < ch.length; c++) {
+      var cn = ch[c];
+      if (!cn || cn.nodeType !== 1 || cn.id === '__agy_metrics_host') continue;
+      if (isOverlayEl(cn)) continue;
+      count++;
+    }
+    return count;
+  }
+
   function findModelSelectorAnchor() {
     if (!document.querySelectorAll) return null;
     var LABEL_RE = /^(Select model|Select a model|Change model|Model Selection|选择模型|切换模型)/i;
@@ -1035,29 +1148,36 @@
 
     if (!modelBtn || !modelBtn.parentElement) return null;
 
+    // 向上查找真正的水平 flex 工具栏行（忽略弹出的下拉菜单/浮层子节点，防止打开模型选择器时跳位到下方）
     var afterNode = modelBtn;
     var p = modelBtn.parentElement;
-    for (var up = 0; up < 2 && p && p.parentElement; up++) {
-      var childCount = 0;
-      var ch = p.children || p.childNodes || [];
-      for (var c = 0; c < ch.length; c++) {
-        var cn = ch[c];
-        if (cn && cn.nodeType === 1 && cn.id !== '__agy_metrics_host') childCount++;
-      }
+    var fallbackRow = null;
+    var fallbackAfter = null;
+    for (var up = 0; up < 5 && p && p.parentElement; up++) {
+      var flowCount = countFlowChildren(p);
       var disp = '';
       try {
         if (window.getComputedStyle) disp = window.getComputedStyle(p).display || '';
       } catch (e) {}
-      if (childCount <= 1 || disp === 'contents') {
-        afterNode = p;
-        p = p.parentElement;
-      } else {
-        break;
+
+      if (disp !== 'contents' && isHorizontalFlexRow(p)) {
+        if (flowCount >= 2) {
+          return { row: p, afterNode: afterNode, modelBtn: modelBtn };
+        }
+        if (!fallbackRow) {
+          fallbackRow = p;
+          fallbackAfter = afterNode;
+        }
       }
+      afterNode = p;
+      p = p.parentElement;
     }
 
-    if (!p || !p.insertBefore) return null;
-    return { row: p, afterNode: afterNode, modelBtn: modelBtn };
+    if (fallbackRow && fallbackRow.insertBefore) {
+      return { row: fallbackRow, afterNode: fallbackAfter, modelBtn: modelBtn };
+    }
+    if (!modelBtn.parentElement || !modelBtn.parentElement.insertBefore) return null;
+    return { row: modelBtn.parentElement, afterNode: modelBtn, modelBtn: modelBtn };
   }
 
   function positionPopover() {
@@ -1085,7 +1205,7 @@
 
     hudHost = document.createElement('div');
     hudHost.id = '__agy_metrics_host';
-    hudHost.style.cssText = 'display:inline-flex;align-items:center;height:28px;min-width:0;flex-shrink:1;margin-left:2px;user-select:none;font-family:inherit;';
+    hudHost.style.cssText = 'display:inline-flex;align-items:center;height:28px;min-width:0;max-width:100%;flex:0 1 auto;overflow:hidden;margin-left:2px;user-select:none;font-family:inherit;';
     if (typeof hudHost.attachShadow === 'function') {
       hudShadow = hudHost.attachShadow({ mode: 'open' });
     } else {
@@ -1094,10 +1214,10 @@
 
     hudShadow.innerHTML =
       '<style>' +
-      ':host{--agy-accent:#3b82f6;--agy-accent-soft:rgba(59,130,246,0.16);--agy-accent-mid:rgba(59,130,246,0.45);}' +
-      '.wrap{position:relative;display:inline-flex;align-items:center;height:28px;font-size:12px;line-height:16px;color:var(--agy-hud-fg,rgba(226,232,240,0.78));}' +
+      ':host{--agy-accent:#3b82f6;--agy-accent-soft:rgba(59,130,246,0.16);--agy-accent-mid:rgba(59,130,246,0.45);display:inline-flex;min-width:0;max-width:100%;overflow:hidden;}' +
+      '.wrap{position:relative;display:inline-flex;align-items:center;height:28px;min-width:0;max-width:100%;overflow:hidden;font-size:12px;line-height:16px;color:var(--agy-hud-fg,rgba(226,232,240,0.78));}' +
       '.wrap.light{color:var(--agy-hud-fg,rgba(30,41,59,0.75));}' +
-      '.chip{display:inline-flex;align-items:center;gap:5px;padding:0 7px;height:28px;border:none;outline:none;border-radius:6px;background:transparent;color:inherit;font:inherit;line-height:16px;cursor:pointer;white-space:nowrap;transition:background .12s,color .12s;}' +
+      '.chip{display:inline-flex;align-items:center;gap:5px;padding:0 7px;height:28px;min-width:0;max-width:100%;overflow:hidden;border:none;outline:none;border-radius:6px;background:transparent;color:inherit;font:inherit;line-height:16px;cursor:pointer;white-space:nowrap;transition:background .12s,color .12s;}' +
       '.chip svg{display:block;flex-shrink:0;}' +
       '.chip span{line-height:16px;}' +
       '.chip-num{font-variant-numeric:tabular-nums;}' +
@@ -1153,15 +1273,15 @@
       '.cap-btn.active{opacity:1;background:#f3f4f6;color:#111827;font-weight:600;}' +
       '.wrap.light .cap-btn.active{background:#111827;color:#ffffff;}' +
       '.cap-note{font-size:9.5px;opacity:.5;line-height:1.35;margin-top:5px;}' +
-      '.tele-grid{display:grid;grid-template-columns:1fr 1fr;border:1px solid rgba(255,255,255,0.08);border-radius:9px;overflow:hidden;margin-bottom:9px;}' +
+      '.tele-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-auto-rows:1fr;border:1px solid rgba(255,255,255,0.08);border-radius:9px;overflow:hidden;margin-bottom:9px;}' +
       '.wrap.light .tele-grid{border-color:rgba(15,23,42,0.08);}' +
-      '.tele-cell{padding:6px 9px;background:transparent;}' +
+      '.tele-cell{display:flex;flex-direction:column;justify-content:center;min-width:0;padding:7px 9px;background:transparent;}' +
       '.tele-cell:nth-child(1),.tele-cell:nth-child(2){border-bottom:1px solid rgba(255,255,255,0.07);}' +
       '.tele-cell:nth-child(odd){border-right:1px solid rgba(255,255,255,0.07);}' +
       '.wrap.light .tele-cell:nth-child(1),.wrap.light .tele-cell:nth-child(2){border-bottom-color:rgba(15,23,42,0.07);}' +
       '.wrap.light .tele-cell:nth-child(odd){border-right-color:rgba(15,23,42,0.07);}' +
-      '.tele-cell .k{font-size:9.5px;opacity:.58;margin-bottom:2px;}' +
-      '.tele-cell .v{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;}' +
+      '.tele-cell .k{font-size:9.5px;opacity:.58;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
+      '.tele-cell .v{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
       '.steps-title{display:flex;justify-content:space-between;align-items:center;font-size:10.5px;font-weight:600;opacity:.78;margin-bottom:4px;}' +
       '.steps-hint{font-size:9.5px;font-weight:400;opacity:.5;}' +
       '.steps-list{display:flex;flex-direction:column;gap:2px;font-size:10px;font-family:inherit;font-variant-numeric:tabular-nums;}' +
@@ -1280,12 +1400,64 @@
     } catch (e) {}
   }
 
+  function measureHudAvailWidth() {
+    var avail = 999;
+    try {
+      var rowEl = hudHost && hudHost.parentElement;
+      if (rowEl && rowEl.getBoundingClientRect) {
+        var pr = rowEl.getBoundingClientRect();
+        if (pr.width > 0) {
+          var siblingsW = 0;
+          var ch = rowEl.children || [];
+          for (var si = 0; si < ch.length; si++) {
+            var sib = ch[si];
+            if (!sib || sib === hudHost || isOverlayEl(sib)) continue;
+            var sr = sib.getBoundingClientRect ? sib.getBoundingClientRect() : null;
+            if (sr && sr.width > 0) siblingsW += sr.width + 6;
+          }
+          avail = Math.max(0, pr.width - siblingsW - 12);
+        }
+      }
+    } catch (e) {}
+    hudAvailWidth = avail;
+    return avail;
+  }
+
+  function attachRowResizeObserver(row) {
+    if (typeof ResizeObserver !== 'function' || !row) return;
+    if (hudObservedRow === row && hudResizeObserver) return;
+    try {
+      if (hudResizeObserver) hudResizeObserver.disconnect();
+      hudObservedRow = row;
+      hudResizeObserver = new ResizeObserver(function() {
+        measureHudAvailWidth();
+        renderHud();
+      });
+      hudResizeObserver.observe(row);
+    } catch (e) {}
+  }
+
   function ensureHudMounted() {
     if (!hudEnabled) {
       if (hudHost && hudHost.parentNode) hudHost.parentNode.removeChild(hudHost);
       hudExpanded = false;
       return;
     }
+
+    // 稳定锚定保护：若已挂载在合法的水平 flex 工具栏且模型按钮仍在其中，
+    // 不要因打开模型下拉菜单触发 DOM 变动而重排/挪动小组件位置
+    if (
+      hudHost && hudHost.isConnected &&
+      hudAnchorBtn && hudAnchorBtn.isConnected &&
+      hudHost.parentElement &&
+      hudHost.parentElement.contains(hudAnchorBtn) &&
+      isHorizontalFlexRow(hudHost.parentElement)
+    ) {
+      attachRowResizeObserver(hudHost.parentElement);
+      renderHud();
+      return;
+    }
+
     var anchor = findModelSelectorAnchor();
     if (!anchor) {
       if (hudHost && hudHost.parentNode) hudHost.parentNode.removeChild(hudHost);
@@ -1304,6 +1476,9 @@
     if (hudHost.parentNode !== row || hudHost.previousElementSibling !== afterNode) {
       row.insertBefore(hudHost, afterNode.nextSibling);
     }
+
+    attachRowResizeObserver(row);
+    measureHudAvailWidth();
 
     try {
       if (window.getComputedStyle) {
@@ -1365,6 +1540,27 @@
     var pct = limit > 0 ? Math.min(100, (100 * ctxTok / limit)) : 0;
     var pctStr = pct.toFixed(1) + '%';
 
+    // 使用 ResizeObserver / 挂载时缓存的可用宽度，避免每次渲染强制同步布局
+    var availWidth = hudAvailWidth;
+    // 4 档自适应：full (>=260) / compact (>=165) / ctx-only (>=78) / icon-only (<78)
+    var mode = availWidth >= 260 ? 'full' : (availWidth >= 165 ? 'compact' : (availWidth >= 78 ? 'ctx' : 'icon'));
+    var isWorking = detectDomWorking() || !!(m && m.isWorking);
+    var liveTps = (streamActive && streamLastTps)
+      ? streamLastTps
+      : (m && m.currentTurnTps !== null && m.currentTurnTps !== undefined
+        ? (mode === 'compact' ? Math.round(m.currentTurnTps) : m.currentTurnTps)
+        : null);
+    var idleTps = m ? (m.lastTurnAvgTps || m.avgTps || m.lastTps) : null;
+
+    var renderKey = [
+      isDark ? 1 : 0, hudExpanded ? 1 : 0, mode,
+      m ? m.convId : '', m ? m.updatedAt : 0,
+      ctxTok, limit, isWorking ? 1 : 0, liveTps, idleTps,
+      window.__agy_zh_enabled !== false ? 1 : 0
+    ].join('|');
+    if (renderKey === lastHudRenderKey && !hudExpanded) return;
+    lastHudRenderKey = renderKey;
+
     if (ring) {
       var circ = 2 * Math.PI * 5.5;
       var offset = circ * (1 - Math.min(1, pct / 100));
@@ -1374,41 +1570,47 @@
       ring.setAttribute('stroke-dashoffset', offset.toFixed(2));
     }
 
-    var narrow = false;
-    try {
-      if (hudHost.parentElement && hudHost.parentElement.getBoundingClientRect) {
-        var pr = hudHost.parentElement.getBoundingClientRect();
-        if (pr.width > 0 && pr.width < 520) narrow = true;
-      }
-    } catch (e) {}
+    var midDot = hudShadow.querySelector ? hudShadow.querySelector('.mid-dot') : null;
+    var showSpd = (mode === 'full' || mode === 'compact');
 
     if (ctxText) {
-      if (!m) {
-        ctxText.textContent = narrow ? '0' : ('0 / ' + formatTok(limit));
-      } else if (narrow) {
-        ctxText.textContent = formatTok(ctxTok) + ' (' + Math.round(pct) + '%)';
+      if (mode === 'icon') {
+        ctxText.style.display = 'none';
       } else {
-        ctxText.textContent = formatTok(ctxTok) + ' / ' + formatTok(limit) + ' (' + pctStr + ')';
+        ctxText.style.display = '';
+        if (!m) {
+          ctxText.textContent = mode === 'full' ? ('0 / ' + formatTok(limit)) : '0';
+        } else if (mode === 'full') {
+          ctxText.textContent = formatTok(ctxTok) + ' / ' + formatTok(limit) + ' (' + pctStr + ')';
+        } else {
+          ctxText.textContent = formatTok(ctxTok) + ' (' + Math.round(pct) + '%)';
+        }
       }
     }
 
+    if (midDot) midDot.style.display = showSpd ? '' : 'none';
+
     if (spdDot && spdText) {
-      var isWorking = detectDomWorking() || !!(m && m.isWorking);
-      if (isWorking) {
-        spdDot.className = 'dot live';
-        var liveTps = (streamActive && streamLastTps)
-          ? streamLastTps
-          : (m && m.currentTurnTps !== null && m.currentTurnTps !== undefined
-            ? (narrow ? Math.round(m.currentTurnTps) : m.currentTurnTps)
-            : null);
-        spdText.textContent = liveTps !== null ? ('工作中 ' + liveTps + ' tok/s') : '工作中';
+      if (!showSpd) {
+        spdDot.style.display = 'none';
+        spdText.style.display = 'none';
       } else {
-        spdDot.className = 'dot idle';
-        var idleTps = m ? (m.lastTurnAvgTps || m.avgTps || m.lastTps) : null;
-        if (idleTps !== null && idleTps !== undefined) {
-          spdText.textContent = narrow ? ('上次平均 ' + Math.round(idleTps) + ' tok/s') : ('上次平均 ' + idleTps + ' tok/s');
+        spdDot.style.display = '';
+        spdText.style.display = '';
+        if (isWorking) {
+          spdDot.className = 'dot live';
+          spdText.textContent = liveTps !== null
+            ? (mode === 'compact' ? (liveTps + ' t/s') : ('工作中 ' + liveTps + ' tok/s'))
+            : '工作中';
         } else {
-          spdText.textContent = !m ? '新对话' : '暂无测速';
+          spdDot.className = 'dot idle';
+          if (idleTps !== null && idleTps !== undefined) {
+            spdText.textContent = mode === 'compact'
+              ? (Math.round(idleTps) + ' t/s')
+              : ('上次平均 ' + idleTps + ' tok/s');
+          } else {
+            spdText.textContent = !m ? '新对话' : '暂无测速';
+          }
         }
       }
     }
@@ -1432,7 +1634,7 @@
           : '<span class="status-tag">新对话</span>';
         popBody.innerHTML =
           '<div class="pop-head">' +
-            '<div class="head-left"><span class="model-name">' + anchorModel.name + '</span></div>' +
+            '<div class="head-left"><span class="model-name">' + escapeHtml(anchorModel.name) + '</span></div>' +
             '<div class="head-right">' + zhBtnHtml + emptyBadge + '</div>' +
           '</div>' +
           '<div class="ctx-block">' +
@@ -1484,16 +1686,19 @@
         ? '<span class="status-tag live"><i class="dot live"></i>实时运行</span>'
         : '<span class="status-tag">空闲</span>';
       var lastAvgVal = m.lastTurnAvgTps !== null && m.lastTurnAvgTps !== undefined ? (m.lastTurnAvgTps + ' tok/s') : '-';
+      var lastE2eNote = (m.lastTurnE2eTps !== null && m.lastTurnE2eTps !== undefined && m.lastTurnAvgTps && Math.abs(m.lastTurnAvgTps - m.lastTurnE2eTps) >= 3)
+        ? ('｜含工具全程均速 ' + m.lastTurnE2eTps + ' tok/s')
+        : '';
       var lastStepVal = m.lastTps !== null && m.lastTps !== undefined ? (m.lastTps + ' tok/s') : '-';
       var allAvgVal = m.avgTps !== null && m.avgTps !== undefined ? (m.avgTps + ' tok/s') : '-';
-      var convShort = m.convShort ? '<span class="conv-tag">#' + m.convShort + '</span>' : '';
+      var convShort = m.convShort ? '<span class="conv-tag">#' + escapeHtml(m.convShort) + '</span>' : '';
       var turnDurSuffix = (m.lastTurnDurationSec !== null && m.lastTurnDurationSec !== undefined)
         ? (' · ' + (m.lastTurnDurationSec >= 60 ? (Math.floor(m.lastTurnDurationSec / 60) + 'm' + Math.round(m.lastTurnDurationSec % 60) + 's') : (m.lastTurnDurationSec + 's')))
         : '';
 
       popBody.innerHTML =
         '<div class="pop-head">' +
-          '<div class="head-left"><span class="model-name">' + (m.modelName || '未知模型') + '</span>' + convShort + '</div>' +
+          '<div class="head-left"><span class="model-name">' + escapeHtml(m.modelName || '未知模型') + '</span>' + convShort + '</div>' +
           '<div class="head-right">' + zhBtnHtml + statusBadge + '</div>' +
         '</div>' +
         '<div class="ctx-block">' +
@@ -1515,7 +1720,7 @@
           '<div class="cap-note">注：Gemini 底层支持 1M，Antigravity 常在 256K~512K 触发自动压缩</div>' +
         '</div>' +
         '<div class="tele-grid">' +
-          '<div class="tele-cell"><div class="k">' + (popWorking ? '本轮平均' : '上次平均') + ' (' + (m.lastTurnSteps || 1) + ' 步' + turnDurSuffix + ')</div><div class="v mono">' + lastAvgVal + '</div></div>' +
+          '<div class="tele-cell" title="纯模型生成均速（不含工具执行等待）' + lastE2eNote + '"><div class="k">' + (popWorking ? '本轮模型均速' : '上次模型均速') + ' (' + (m.lastTurnSteps || 1) + '步' + turnDurSuffix + ')</div><div class="v mono">' + lastAvgVal + '</div></div>' +
           '<div class="tele-cell"><div class="k">最近单步速度</div><div class="v mono">' + lastStepVal + '</div></div>' +
           '<div class="tele-cell"><div class="k">全会话总平均</div><div class="v mono">' + allAvgVal + '</div></div>' +
           '<div class="tele-cell"><div class="k">本轮 / 累计产出</div><div class="v mono">' + formatTok(m.lastTurnOutputTokens) + ' / ' + formatTok(m.totalOutputTokens) + '</div></div>' +
@@ -1561,22 +1766,29 @@
 
     if (!hudResizeHandler && window.addEventListener) {
       hudResizeHandler = function() {
+        measureHudAvailWidth();
         if (hudExpanded) positionPopover();
         renderHud();
       };
       window.addEventListener('resize', hudResizeHandler);
     }
 
-    if (typeof setInterval === 'function') {
-      if (!hudThemeTimer) hudThemeTimer = setInterval(renderHud, 3000);
-      if (!hudStreamTimer) hudStreamTimer = setInterval(updateStreamSpeed, 250);
+    // 事件驱动监听主题切换（替代 3 秒轮询定时器）
+    if (!hudThemeObserver && typeof MutationObserver === 'function' && document.documentElement) {
+      hudThemeObserver = new MutationObserver(function() {
+        renderHud();
+      });
+      try {
+        hudThemeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style'] });
+      } catch (e) {}
     }
   }
 
   function destroyHud() {
-    try { if (hudThemeTimer) { clearInterval(hudThemeTimer); hudThemeTimer = null; } } catch (e) {}
-    try { if (hudStreamTimer) { clearInterval(hudStreamTimer); hudStreamTimer = null; } } catch (e) {}
+    try { if (hudThemeObserver) { hudThemeObserver.disconnect(); hudThemeObserver = null; } } catch (e) {}
+    stopStreamTimer();
     try { if (hudRemountTimer) { clearTimeout(hudRemountTimer); hudRemountTimer = null; } } catch (e) {}
+    try { if (hudResizeObserver) { hudResizeObserver.disconnect(); hudResizeObserver = null; hudObservedRow = null; } } catch (e) {}
     try { if (hudResizeHandler && window.removeEventListener) { window.removeEventListener('resize', hudResizeHandler); hudResizeHandler = null; } } catch (e) {}
     try { if (hudDocClickHandler) { document.removeEventListener('click', hudDocClickHandler); hudDocClickHandler = null; } } catch (e) {}
     try { if (hudKeyHandler) { document.removeEventListener('keydown', hudKeyHandler); hudKeyHandler = null; } } catch (e) {}
@@ -1590,14 +1802,14 @@
     hudWrap = null;
     hudAnchorBtn = null;
     hudExpanded = false;
+    lastHudRenderKey = '';
   }
 
   window.__agy_update_metrics = function(payload) {
     hudPayload = payload || null;
     var active = pickActiveConversation(hudPayload);
-    if (active && active.updatedAt > streamBaselineUpdatedAt) {
-      streamBaselineUpdatedAt = active.updatedAt || 0;
-      tempIdleTps = null;
+    if (active && active.isWorking) {
+      startStreamTimer();
     }
     ensureHudMounted();
     renderHud();
@@ -1722,7 +1934,7 @@
         renderHud();
       }
     });
-    window.__agy_zh_flag = true;
+    window.__agy_zh_flag = INIT_ZH;
   } catch (e) { /* 环境不支持时退化为始终启用 */ }
 
   // 供热升级与外部调用：断开监听并还原英文
@@ -1736,28 +1948,50 @@
   // ====== 启动 ======
   var rescanTimer = null;
 
-  // 定时全量重扫：保证设置面板等动态渲染的内容被翻译
-  // MutationObserver 会捕获新节点，但 React 异步渲染可能导致节点被首次处理时
-  // 文本还不完整，textOrigin 缓存了"无法翻译"的状态，此后不再重试。
-  // 重扫逻辑：找到所有仍含英文且能匹配词典的文本节点，清除缓存后强制重新翻译。
+  // 惰性清理已脱离文档的 DOM 引用，避免 SPA 长时间运行累积 Detached DOM
+  function pruneDetachedOrigins() {
+    if (textOrigins) {
+      textOrigins.forEach(function(_, node) {
+        if (!node || !node.isConnected) textOrigins.delete(node);
+      });
+    }
+    if (attrOrigins) {
+      attrOrigins.forEach(function(_, el) {
+        if (!el || !el.isConnected) attrOrigins.delete(el);
+      });
+    }
+  }
+
+  // 定时重扫：保证设置面板等动态渲染的内容被翻译
+  // 跳过 textOrigin 已记录且文本未变化的节点，并加上帧时间预算，避免长对话下阻塞主线程。
   function rescan() {
     if (document.hidden) return;
     ensureHudMounted();
+    var now = Date.now();
+    if ((now - lastPruneAt) >= 30000 || (textOrigins && textOrigins.size > 2000)) {
+      lastPruneAt = now;
+      pruneDetachedOrigins();
+    }
     if (window.__agy_zh_enabled === false) return;
     if (!document.body) return;
-    var now = Date.now();
-    // 仅在发生 DOM 变动后或超过 15 秒兜底周期时才执行全量 TreeWalker，空闲时零耗
+    // 仅在发生 DOM 变动后或超过 15 秒兜底周期时才执行扫描，空闲时零耗
     if (!domDirty && (now - lastRescanAt) < 15000) return;
     domDirty = false;
     lastRescanAt = now;
+    var deadline = now + CFG.budgetMs;
     var walker = document.createTreeWalker(
       document.body,
       NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
       null,
       false
     );
-    var n, retried = 0;
+    var n, retried = 0, scanned = 0;
     while ((n = walker.nextNode())) {
+      if (++scanned > CFG.maxScanNodes) break;
+      if ((scanned & 255) === 0 && Date.now() > deadline) {
+        domDirty = true;  // 超出单帧预算，下轮继续补完
+        break;
+      }
       if (n.nodeType === 1) {
         if (!SKIP_TAGS[n.tagName]) {
           var beforeAttr = touchedAttr;
@@ -1767,6 +2001,8 @@
         continue;
       }
       var cur = n.textContent || '';
+      // 跳过已处理且内容未变化的节点（仅在文本真正变化后重试）
+      if (textOrigin && textOrigin.get(n) === cur) continue;
       // 只处理含英文的、非空的文本
       if (!cur.trim() || cur.trim().length < 2 || !/[a-zA-Z]/.test(cur)) continue;
       var parent = n.parentElement;
@@ -1778,7 +2014,6 @@
       if (AMBIGUOUS_SHORT[trimmedCur] && ((parent && parent.childNodes && parent.childNodes.length > 1) || cur !== trimmedCur)) {
         continue;
       }
-      // 对仍含英文的节点尝试翻译（清除旧缓存）
       var result = tryTranslate(cur);
       if (result === null) result = tryCompactTime(cur, parent);
       result = fixNewBadge(cur, trimmedCur, result, parent);
@@ -1788,6 +2023,8 @@
         touchedText++;
         if (textOrigin) textOrigin.set(n, result);
         retried++;
+      } else if (textOrigin) {
+        textOrigin.set(n, cur);
       }
     }
     if (retried) syncStats();
@@ -1797,18 +2034,20 @@
     if (!document.body) { setTimeout(boot, 50); return; }
     observe();
     captureExisting();          // 先登记现状（英文原文），再开始翻译
-    walkAndTranslate(document.body);
-    var repaired = repairCjkSpacing();
+    var repaired = 0;
+    if (INIT_ZH) {
+      walkAndTranslate(document.body);
+      repaired = repairCjkSpacing();
+    }
     cjkFixed = repaired;
-    initHud();
+    if (INIT_HUD) initHud();
     syncStats();
     if (repaired) console.log('[汉化] 已修复旧引擎遗留的词间空格: ' + repaired + ' 处');
-    // 启动定时重扫（每 1.5 秒），保证动态面板被翻译
+    // 启动兜底重扫（每 3 秒检查一次，无 DOM 变动时直接跳过）
     if (rescanTimer && typeof clearInterval === 'function') clearInterval(rescanTimer);
-    if (typeof setInterval === 'function') rescanTimer = setInterval(rescan, 1500);
-    console.log('[汉化] observer_plus 已激活｜词条 ' + dictKeys.length +
-                '｜严格模式 ' + (!CFG.allowPartialPhrases) +
-                '｜已监听属性重译｜定时重扫已启动');
+    if (typeof setInterval === 'function') rescanTimer = setInterval(rescan, 3000);
+    console.log('[汉化] observer_plus v' + ENGINE_VERSION + ' 已激活｜词条 ' + dictKeys.length +
+                '｜汉化 ' + INIT_ZH + '｜监测 ' + INIT_HUD);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);

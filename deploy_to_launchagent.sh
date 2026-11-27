@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Antigravity 汉化 — 一键安装 / 同步部署到 LaunchAgent
-# ======================================================
+# Antigravity 汉化 v0.3.2 — 一键安装 / 同步部署到 LaunchAgent
+# ==============================================================
 # 支持两种场景：
 #   · 全新 Mac（首次迁移）：自动创建 ~/.antigravity-zh 与 LaunchAgent 开机自启服务
-#   · 已有环境（词典/引擎更新）：先自动备份，再同步并热升级运行中的窗口
+#   · 已有环境（词典/引擎更新）：先自动备份（最多保留 3 份），再同步并热升级运行中的窗口
 #
-# 用法: bash deploy_to_launchagent.sh
+# 用法:
+#   bash deploy_to_launchagent.sh                 # 默认：汉化 + 模型监测
+#   bash deploy_to_launchagent.sh --no-metrics    # 仅汉化（不挂载小组件，不读日志）
+#   bash deploy_to_launchagent.sh --metrics-only  # 仅模型监测（保持英文原版界面）
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
@@ -15,10 +18,37 @@ LABEL="local.antigravity-zh"
 PLIST="$LAUNCH_DIR/$LABEL.plist"
 TS="$(date +%Y%m%d-%H%M%S)"
 BK="$DST/backup-$TS"
+EXTRA_FLAG=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-metrics|--metrics-only) EXTRA_FLAG="$arg" ;;
+    -h|--help)
+      echo "用法: bash deploy_to_launchagent.sh [--no-metrics | --metrics-only]"
+      exit 0
+      ;;
+  esac
+done
+
+# ── 0) 统一探测可用的 Python 3.8+ 解释器 ──
+PY_BIN=""
+for cand in "/usr/bin/python3" "$(command -v python3 2>/dev/null || true)" "/opt/homebrew/bin/python3" "/usr/local/bin/python3"; do
+  [ -n "$cand" ] && [ -x "$cand" ] || continue
+  if "$cand" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
+    PY_BIN="$cand"
+    break
+  fi
+done
+if [ -z "$PY_BIN" ]; then
+  echo "❌ 未找到可用的 Python 3.8+ 解释器，请先安装 Python 3 或 Xcode Command Line Tools。"
+  exit 1
+fi
 
 echo "════════════════════════════════════════════════════"
 echo " 部署目标: $DST"
+echo " Python  : $PY_BIN"
 echo " 备份目录: $BK"
+[ -n "$EXTRA_FLAG" ] && echo " 运行模式: $EXTRA_FLAG"
 echo "════════════════════════════════════════════════════"
 
 mkdir -p "$DST" "$BK" "$LAUNCH_DIR"
@@ -26,11 +56,19 @@ mkdir -p "$DST" "$BK" "$LAUNCH_DIR"
 # 确保本目录的 .command / .sh 具备可执行权限（防止跨机拷贝丢失权限）
 chmod +x "$SRC"/*.command "$SRC"/*.sh 2>/dev/null || true
 
-# ── 1) 备份现有部署文件 ──
+# ── 1) 备份现有部署文件，并自动清理旧备份（仅保留最近 3 份）──
 for f in dict.json observer_plus.js doctor.py run_observer_plus.py; do
   [ -f "$DST/$f" ] && cp -p "$DST/$f" "$BK/$f" && echo " 备份 $f"
 done
 [ -f "$PLIST" ] && cp -p "$PLIST" "$BK/$LABEL.plist" && echo " 备份 plist"
+"$PY_BIN" - "$DST" <<'PY'
+import shutil, sys
+from pathlib import Path
+dst = Path(sys.argv[1])
+bks = sorted([p for p in dst.glob("backup-*") if p.is_dir()], key=lambda p: p.name, reverse=True)
+for old in bks[3:]:
+    shutil.rmtree(old, ignore_errors=True)
+PY
 
 # ── 2) 同步词典、引擎与注入器 ──
 cp -p "$SRC/dict.json"             "$DST/dict.json"
@@ -38,7 +76,7 @@ cp -p "$SRC/observer_plus.js"      "$DST/observer_plus.js"
 cp -p "$SRC/doctor.py"             "$DST/doctor.py"
 cp -p "$SRC/run_observer_plus.py"  "$DST/run_observer_plus.py"
 
-COUNT=$(python3 - "$DST/dict.json" <<'PY'
+COUNT=$("$PY_BIN" - "$DST/dict.json" <<'PY'
 import json, sys
 from pathlib import Path
 d = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
@@ -48,11 +86,11 @@ PY
 echo " 已同步: dict.json（${COUNT} 条）/ observer_plus.js / doctor.py / run_observer_plus.py"
 
 # ── 3) 自动创建或更新 LaunchAgent plist（新机器首次迁移也能一键完成）──
-python3 - "$PLIST" "$DST" "$LABEL" <<'PY'
+"$PY_BIN" - "$PLIST" "$DST" "$LABEL" "$PY_BIN" "$EXTRA_FLAG" <<'PY'
 import plistlib, sys
 from pathlib import Path
 
-plist, dst, label = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+plist, dst, label, py_bin, extra_flag = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
 if plist.exists():
     data = plistlib.loads(plist.read_bytes())
 else:
@@ -63,7 +101,10 @@ else:
         "StandardOutPath": str(dst / "translate.log"),
         "StandardErrorPath": str(dst / "translate.log"),
     }
-data["ProgramArguments"] = ["/usr/bin/python3", str(dst / "run_observer_plus.py")]
+prog = [py_bin, str(dst / "run_observer_plus.py")]
+if extra_flag:
+    prog.append(extra_flag)
+data["ProgramArguments"] = prog
 data["StandardOutPath"] = str(dst / "translate.log")
 data["StandardErrorPath"] = str(dst / "translate.log")
 plist.write_bytes(plistlib.dumps(data))
@@ -74,7 +115,14 @@ PY
 U="$(id -u)"
 launchctl bootout "gui/$U/$LABEL" 2>/dev/null || true
 sleep 1
-launchctl bootstrap "gui/$U" "$PLIST" 2>/dev/null || launchctl load -w "$PLIST" 2>/dev/null || true
+ERR_FILE="$(mktemp)"
+if ! launchctl bootstrap "gui/$U" "$PLIST" 2>"$ERR_FILE"; then
+  if ! launchctl load -w "$PLIST" 2>>"$ERR_FILE"; then
+    echo " ⚠️ launchctl 启动返回错误："
+    sed 's/^/    /' "$ERR_FILE" | head -n 5
+  fi
+fi
+rm -f "$ERR_FILE"
 sleep 3
 
 echo "════════════════════════════════════════════════════"

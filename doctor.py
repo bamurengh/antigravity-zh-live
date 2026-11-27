@@ -34,9 +34,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 DICT_FILE = SCRIPT_DIR / "dict.json"
-OBSERVER_FILE = SCRIPT_DIR / "observer.js"
 OBSERVER_PLUS_FILE = SCRIPT_DIR / "observer_plus.js"
-TRANSLATE_FILE = SCRIPT_DIR / "translate.py"
 
 APP_SUPPORT = Path.home() / "Library" / "Application Support" / "Antigravity"
 DEVTOOLS_PORT_FILE = APP_SUPPORT / "DevToolsActivePort"
@@ -109,6 +107,7 @@ class MiniWS:
         if b"101" not in status:
             raise ConnectionError(f"WebSocket 握手失败: {status.decode(errors='replace')}")
         self._buf = buf.split(b"\r\n\r\n", 1)[1]
+        self._seq = 0
 
     def _read(self, n):
         while len(self._buf) < n:
@@ -168,11 +167,13 @@ class MiniWS:
                 return payload.decode("utf-8", errors="replace")
 
     def evaluate(self, expression, timeout_msg="执行超时"):
+        self._seq += 1
+        req_id = self._seq
         self.send(json.dumps({
-            "id": 1, "method": "Runtime.evaluate",
+            "id": req_id, "method": "Runtime.evaluate",
             "params": {"expression": expression, "returnByValue": True, "awaitPromise": False},
         }))
-        # 只等到 id==1 的那条响应；忽略 CDP 事件
+        # 只等到 id==req_id 的那条响应；忽略 CDP 事件
         while True:
             raw = self.recv_text()
             if raw is None:
@@ -181,7 +182,7 @@ class MiniWS:
                 msg = json.loads(raw)
             except ValueError:
                 continue
-            if msg.get("id") == 1:
+            if msg.get("id") == req_id:
                 if "error" in msg:
                     raise RuntimeError(f"CDP 错误: {msg['error']}")
                 res = msg.get("result", {}).get("result", {})
@@ -394,19 +395,18 @@ def check_injection(rep, ws, entries):
     st = json.loads(raw)
     if not st["injected"]:
         rep.add("warn", "当前页面尚未注入汉化",
-                fix="运行 python3 translate.py 注入；或说明上一条 WebSocket 检查失败才是根因。")
+                fix="运行 python3 run_observer_plus.py 注入，或执行 bash deploy_to_launchagent.sh 启动后台守护进程。")
         return st
 
-    engine = (st.get("stats") or {}).get("engine", "observer（原版）")
+    engine = (st.get("stats") or {}).get("engine", "observer（旧版）")
     rep.add("ok", f"已注入，引擎 = {engine}",
-            json.dumps(st.get("stats"), ensure_ascii=False) if st.get("stats") else "（原版引擎不暴露统计）")
+            json.dumps(st.get("stats"), ensure_ascii=False) if st.get("stats") else "（旧版引擎不暴露统计）")
     rep.add("info", f"开关 __agy_zh_enabled = {st.get('enabled')}"
                     f"｜可反注 __agy_zh_uninstall = {st.get('hasUninstall')}")
     if engine != "observer_plus":
-        rep.add("warn", "当前运行的是原版引擎（缺陷仍在）",
-                detail="原版：不监听属性变化、元素级标记过死、仅整串精确匹配。",
-                fix="增强引擎 observer_plus.js 已就绪且接口兼容，\n"
-                    "经确认后可将其内容替换进 translate.py 的 OBSERVER_FILE 指向（原文件保持不变时可另存副本）。")
+        rep.add("warn", "当前运行的不是 observer_plus 引擎",
+                detail="旧版引擎不支持属性重译、短语切分与内置 HUD 小组件。",
+                fix="运行 bash deploy_to_launchagent.sh 即可热升级到最新版 observer_plus.js。")
     return st
 
 
@@ -468,7 +468,10 @@ def check_coverage(rep, ws):
               else if (!seenEn.has(v)) { seenEn.add(v); attrEn.push(v.slice(0, 48)); }
             }
           }
+          const SKIP = { SCRIPT:1, STYLE:1, CODE:1, PRE:1, TEXTAREA:1, SVG:1, KBD:1, SAMP:1 };
           for (const el of document.querySelectorAll('*')) {
+            if (SKIP[el.tagName]) continue;
+            if (el.id === '__agy_metrics_host' || (el.closest && el.closest('#__agy_metrics_host, code, pre, svg'))) continue;
             for (const n of el.childNodes) {
               if (n.nodeType !== 3) continue;
               const t = (n.textContent || '').trim();
@@ -508,10 +511,7 @@ def check_coverage(rep, ws):
     if ui_en:
         rep.add("info", "仍未汉化的 UI 文案样例",
                 "\n".join(ui_en[:15]),
-                fix="这些就是「精确匹配」翻不到的部分：\n"
-                    "· 多词标签（如 Conversation History / Archive conversation）→ 增强引擎的短语切分可覆盖\n"
-                    "· 缺词条（如 Install IDE / Load older messages）→ 需在 dict.json 补词条\n"
-                    "注：dict.json 属原数据，补充前请先备份，避免覆盖既有 329 条。")
+                fix="可将需要汉化的词条补充到 dict.json 后执行 bash deploy_to_launchagent.sh 热更新。")
     if other:
         rep.add("info", f"代码 / 路径 / 用户数据 {len(other)} 条（不应翻译）",
                 "\n".join(other[:8]))

@@ -38,11 +38,11 @@ bash deploy_to_launchagent.sh
 
 - **非侵入式实时汉化**
   - 不修改 `/Applications/Antigravity.app` 任何二进制或资源文件，升级 Antigravity 无需重新打补丁。
-  - 内置 **1935 条**适配 Antigravity 2.34+ 的精选词典，支持空白归一化、大小写兜底、动态文案匹配及 React 属性变更（`placeholder` / `title` / `aria-label` / `data-tooltip`）自动重译。
-  - 严格防误翻机制：自动跳过代码块、输入框、路径与 URL，对短词启用防拆句保护，且单批处理控制在 `12ms` 帧预算内，界面零卡顿。
+  - 内置 **1930+ 条**适配 Antigravity 2.34+ 的精选词典，支持空白归一化、大小写兜底、词典分桶快速短语匹配、动态文案匹配及 React 属性变更（`placeholder` / `title` / `aria-label` / `data-tooltip`）自动重译。
+  - 严格防误翻机制：自动跳过代码块、输入框、路径与 URL，对短词启用防拆句保护，单批处理控制在 `12ms` 帧预算内并自动清理脱离文档的节点引用，界面零卡顿、长会话不泄漏。
 - **内嵌上下文与 Token 速度小组件**
-  - 采用 Shadow DOM 样式隔离，无边框、无阴影，原生融入底部工具栏并自动适配亮色 / 暗色主题。
-  - 实时显示上下文窗口占用（绿 / 黄 / 红三档状态）与模型生成速率，点击可查看详细用量与单步明细。
+  - 采用 Shadow DOM 样式隔离，无边框、无阴影，原生融入底部工具栏并自动适配亮色 / 暗色主题；支持 4 档窄屏自适应收缩与下拉菜单稳定锚定，缩放窗口或切换模型时不遮挡、不跳位。
+  - 实时显示上下文窗口占用（绿 / 黄 / 红三档状态）与模型生成速率，点击可查看详细用量、单步明细，并在弹窗右上角一键原地免刷新切换中/英文。
 - **后台守护与免重启热升级**
   - 通过 macOS `LaunchAgent` 后台自动运行，页面刷新或窗口重载时自动重新注入。
   - 修改 `dict.json` 或 `observer_plus.js` 后，执行部署脚本即可自动备份旧版本并在运行中的窗口完成热替换，**无需重启 Antigravity**。
@@ -66,10 +66,12 @@ bash deploy_to_launchagent.sh
 
 ### 2. 暂停 / 恢复汉化（中英一键切换）
 
-因为翻译脚本是运行时注入页面的，切换回纯英文无需复杂还原 DOM，做到零残留：
+支持两种切换方式：
 
-- **切回纯英文**：双击 **`暂停汉化.command`**，然后在 Antigravity 窗口按 `Cmd+R` 刷新即可。
-- **恢复中文**：双击 **`恢复汉化.command`**，然后在 Antigravity 窗口按 `Cmd+R` 刷新即可。
+- **原地免刷新切换（推荐）**：点击输入框底部小组件展开详情卡片，点击右上角的 **`中` / `EN`** 按钮即可在当前页面即时切换中英文。
+- **彻底停止/恢复后台注入**：
+  - **切回纯英文**：双击 **`暂停汉化.command`**，然后在 Antigravity 窗口按 `Cmd+R` 刷新即可。
+  - **恢复中文**：双击 **`恢复汉化.command`**，然后在 Antigravity 窗口按 `Cmd+R` 刷新即可。
 
 也可以使用命令行等效操作：
 
@@ -84,13 +86,13 @@ bash agyzh.sh toggle   # 中英状态切换
 
 在汉化激活状态下，对话输入框底部「选择模型」按钮右侧会自动嵌入一个原生风格的轻量指示器：
 
-- **上下文窗口占用**：实时显示当前对话已用 Token、容量上限与占用百分比，并按负载自动变色（`<50%` 绿、`50%~75%` 黄、`>=75%` 红）；切换至非对话页面时自动隐藏。
+- **上下文窗口占用**：实时显示当前对话已用 Token、容量上限与占用百分比，并按负载自动变色（`<65%` 蓝、`65%~85%` 黄、`>=85%` 红）；窗口或侧边栏缩小时自动 4 档紧凑收缩，切换至非对话页面时自动隐藏。
 - **Token 生成速度**：
-  - **工作时**：流式输出期间每 `250ms` 实时跳动估算（`实时 ~XX tok/s`），多步推理间隙显示当前轮步速（`工作中 XX tok/s`），静默思考阶段显示 `思考生成中…`。
-  - **空闲时**：自动定格并注明上一次提问完整过程的平均生成速度（`上次均速 XX tok/s`）。
+  - **工作时**：流式输出期间按需启动 `250ms` 实时估算（`工作中 XX tok/s`）；回归空闲自动停止定时器（0 唤醒）。
+  - **空闲时**：自动定格并显示上一次模型调用均速（`上次平均 XX tok/s`）。
 - **交互功能**：
-  - **点击指示器**：在上方弹出详情卡片，查看新增输入、缓存命中率、上次均速 / 最近单步 / 全会话总均速、近期模型调用明细（`第X轮·步` 与 `工具 / 回复` 类型），并可手动切换窗口容量基准（`自动 / 1M / 512K / 256K / 200K`）。
-  - **临时隐藏 / 关闭**：在开发者工具控制台执行 `window.__agy_hud_enabled = false` 可临时隐藏；或在手动启动注入器时附加 `--no-metrics` 关闭指标推送。
+  - **点击指示器**：在上方弹出详情卡片，查看新增输入、缓存命中率、上次模型均速（悬停提示含工具全程均速）/ 最近单步 / 全会话总平均、近期模型调用明细（`R轮·步` 与 `工具 / 回复` 类型），支持切换窗口容量基准（`自动 / 1M / 512K / 256K / 200K`）与右上角 **`中 / EN`** 原地免刷新中英切换。
+  - **独立开关**：支持 `--no-metrics`（纯汉化、不挂载小组件且不读日志）或 `--metrics-only`（英文原版 + 仅开监测小组件）。
 
 ---
 
@@ -110,11 +112,14 @@ bash deploy_to_launchagent.sh
 如果不使用 LaunchAgent，也可以直接在前台手动运行注入器：
 
 ```bash
-python3 run_observer_plus.py               # 前台常驻运行（Ctrl+C 停止）
-python3 run_observer_plus.py --once        # 仅注入当前页面一次后退出
-python3 run_observer_plus.py --no-metrics  # 仅启用界面汉化，关闭小组件指标推送
+python3 run_observer_plus.py                # 前台常驻运行（汉化 + 模型监测，Ctrl+C 停止）
+python3 run_observer_plus.py --no-metrics   # 仅启用界面汉化，不挂载小组件且不读取本地日志
+python3 run_observer_plus.py --metrics-only # 仅启用上下文与速度小组件，保持原始英文界面
+python3 run_observer_plus.py --once         # 仅注入当前页面一次后退出
 python3 run_observer_plus.py --log /tmp/agy_zh.log  # 将运行日志写入指定文件
 ```
+
+> 部署脚本同样支持解耦模式：`bash deploy_to_launchagent.sh --no-metrics` 或 `bash deploy_to_launchagent.sh --metrics-only`。
 
 ---
 
@@ -154,13 +159,14 @@ Antigravity 2.34 起默认不开启 CDP 调试端口。请改用双击 **`启动
 <details>
 <summary><b>4. 如何彻底卸载？</b></summary>
 
-依次卸载 LaunchAgent 服务并删除本地部署目录即可（Antigravity 本体未被修改，无需重装）：
+运行项目根目录的一键卸载脚本即可（Antigravity 本体未被修改，无需重装）：
 
 ```bash
-launchctl bootout "gui/$(id -u)/local.antigravity-zh" 2>/dev/null || true
-rm -f ~/Library/LaunchAgents/local.antigravity-zh.plist
-rm -rf ~/.antigravity-zh
+bash uninstall.sh               # 停止后台服务、清理页面注入并删除部署目录与 plist
+bash uninstall.sh --keep-dict   # 卸载前自动把 dict.json 备份到桌面
 ```
+
+卸载后完全退出（`Cmd+Q`）并从 Dock 正常重启 Antigravity，即可关闭 CDP 调试端口。
 </details>
 
 ---
@@ -174,23 +180,28 @@ antigravity-zh-live/
 ├── 恢复汉化.command                 # 快捷脚本：一键恢复汉化（切回中文）
 ├── agyzh.sh                        # 命令行开关：toggle / on / off / status
 ├── _agyzh_action.sh                # 供 .command 双击调用的交互包装脚本
-├── deploy_to_launchagent.sh        # 一键安装、自动备份与 LaunchAgent 同步热更新脚本
-├── run_observer_plus.py            # 后台注入守护进程（刷新重注、版本热升级、指标推送）
+├── deploy_to_launchagent.sh        # 一键安装、自动备份（保留最近 3 份）与 LaunchAgent 热更新脚本
+├── uninstall.sh                    # 一键完整卸载脚本（支持 --keep-dict 保留词典备份）
+├── run_observer_plus.py            # 后台注入守护进程（持久 WS、单会话增量解析、休眠自愈）
 ├── observer_plus.js                # DOM 翻译引擎与 Shadow DOM 上下文/Token 小组件
-├── dict.json                       # 汉化词典（适配 Antigravity 2.34+，1935 条）
+├── dict.json                       # 汉化词典（适配 Antigravity 2.34+，1930+ 条）
 ├── doctor.py                       # 只读健康诊断工具（同时提供 MiniWS 给注入器复用）
+├── check_project.py                # 词典质量与脚本语法/增量解析一键自检工具
 ├── LICENSE                         # MIT 开源协议
 └── README.md                       # 项目说明文档
 ```
 
 ---
 
-## 安全与隐私说明
+## 安全、隐私与指标计算说明
 
 - **零文件篡改**：不修改 `/Applications/Antigravity.app` 任何文件。
-- **纯本地运行**：不访问任何外网地址，仅连接本机 `127.0.0.1` 的 CDP 调试端口。
-- **零第三方依赖**：仅依赖 macOS 系统自带 Python 3 标准库与原生浏览器 DOM API。
-- **内容保护**：自动跳过 `script` / `style` / `code` / `pre` / `input` / `textarea` / `select` / `option` / `svg` / `kbd` / `samp`、代码块、本地路径和 URL，绝不污染对话正文与代码内容。
+- **纯本地运行**：不访问任何外网地址，仅连接本机 `127.0.0.1` 的 CDP 调试端口，并校验 `/json/version` 归属与目标页面 URL（排除 `devtools://`、扩展页与空白页）。
+- **隐私零采集**：模型监测仅增量读取当前活跃会话的 Token 数值与时间戳，**绝不读取或传输任何用户聊天正文内容**；使用 `--no-metrics` 时彻底不读取本地会话目录。
+- **零第三方依赖**：仅依赖 macOS Python 3.8+ 标准库与原生浏览器 DOM API。
+- **指标计算口径**：
+  - **上下文窗口占用**：`input_tokens`（新增输入）+ `cache_read_tokens`（缓存命中），二者经实测互斥无重复。
+  - **速度指标**：流式输出期基于 DOM 增量字符实时估算；完成后主值展示**模型生成均速**（纯模型生成耗时），鼠标悬停可查看**含工具全程均速**。
 
 ---
 

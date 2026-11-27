@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-Antigravity 汉化 — 增强引擎启动器（translate.py 的零改动替代入口）
-==================================================================
-本文件是纯新增文件，translate.py / observer.js / dict.json 保持原样不动。
-
-它与原版 translate.py 共用同一套注入原理（CDP + Runtime.evaluate），差别只有两点：
-    1. 注入增强引擎 observer_plus.js（修补了 4 个缺陷）
-    2. 支持行内补丁模式：不修改 observer.js，也能把它升级成增强版的内存副本
+Antigravity 汉化 — 后台注入守护进程（run_observer_plus.py）
+============================================================
+通过本机 127.0.0.1 CDP 调试接口将 observer_plus.js + dict.json 注入
+Antigravity 页面，并按需增量推送上下文窗口与 Token 速度遥测数据。
 
 用法:
-    python3 run_observer_plus.py                # 启动汉化（增强引擎），Ctrl+C 停止
-    python3 run_observer_plus.py --engine observer.js --patch   # 行内打补丁升级原版引擎
+    python3 run_observer_plus.py                # 前台常驻运行，Ctrl+C 停止
+    python3 run_observer_plus.py --once         # 只注入一次后退出
+    python3 run_observer_plus.py --no-metrics   # 仅启用界面汉化，关闭小组件数据推送
     python3 run_observer_plus.py --log ~/Library/Logs/agy_zh.log
-    python3 run_observer_plus.py --once         # 只注入一次就退出（便于 GUI 自动化）
 
-与原版一致的承诺:
-    · 不写任何文件（除非显式指定 --log）
-    · 只连 127.0.0.1
-    · Ctrl+C 干净退出（页面内已注入的脚本随页面刷新消失）
+核心保障:
+    · 不修改 Antigravity 任何安装文件
+    · 只连 127.0.0.1，零外网访问
+    · 持久复用的 CDP WebSocket 连接 + 空闲动态退避轮询
+    · 字节偏移增量解析 transcript.jsonl + 有界缓存
 """
 import argparse
 from datetime import datetime
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -34,99 +33,73 @@ sys.path.insert(0, str(Path(__file__).parent.resolve()))
 from doctor import MiniWS, DEVTOOLS_PORT_FILE, DICT_FILE  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-POLL_INTERVAL = 3
+APP_VERSION = "0.3.2"
+POLL_INTERVAL = 6.0
 ACTIVE_POLL_INTERVAL = 0.8
+IDLE_POLL_INTERVAL = 2.4
+DEEP_IDLE_POLL_INTERVAL = 4.0
+PAGES_REFRESH_INTERVAL = 10.0
 BRAIN_DIR = Path.home() / ".gemini" / "antigravity" / "brain"
+MAX_CACHE_CONVS = 64
+MAX_LOG_BYTES = 2 * 1024 * 1024
+KEEP_LOG_BYTES = 512 * 1024
 
-_BRAIN_SCAN_CACHE = {"mtime_ns": 0, "checked_at": 0.0, "dirs": []}
 _TRANSCRIPT_CACHE = {}
 _STEP_END_TS = {}
 
 
 # ============================================================
-# ============================================================
-# 对原版 observer.js 做「内存内补丁」，等价于修掉 3 个缺陷
-# ============================================================
+# 持久 CDP WebSocket 连接池与注入工具
 # ============================================================
 
-def patch_observer_source(src):
-    """把原版 observer.js 在内存里升级成增强版行为。
-    只做字符串级替换，源文件保持原样。返回 (补丁后源码, 已应用项列表)。"""
-    applied = []
+class WSPool:
+    """按 target_id 复用本机 CDP WebSocket 连接，断线自动重连。"""
 
-    # ① 监听属性变化（原版缺失 attributes:true）
-    old_observe = """  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-    characterData: true
-  });"""
-    new_observe = """  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-    characterData: true,
-    attributes: true,
-    attributeFilter: ['placeholder', 'title', 'aria-label', 'data-tooltip']
-  });"""
-    if old_observe in src:
-        src = src.replace(old_observe, new_observe)
-        applied.append("① 增加 attributes:true + attributeFilter（属性变化后重译）")
+    def __init__(self):
+        self._conns = {}  # target_id -> (port, MiniWS)
 
-    # ② MutationObserver 回调里处理 attributes 变更
-    old_cb = """      } else if (mutation.type === 'characterData') {
-        processTextNode(mutation.target);
-      }"""
-    new_cb = """      } else if (mutation.type === 'characterData') {
-        processTextNode(mutation.target);
-      } else if (mutation.type === 'attributes') {
-        var _el = mutation.target;
-        delete _el[MARK];              // 元素标记过死会导致属性永不重译，这里放开
-        processElementAttrs(_el);
-      }"""
-    if old_cb in src:
-        src = src.replace(old_cb, new_cb)
-        applied.append("② attributes 变更回调 + 放开元素级 MARK（可重译）")
+    def _drop(self, target_id):
+        item = self._conns.pop(target_id, None)
+        if item:
+            try:
+                item[1].close()
+            except Exception:
+                pass
 
-    # ③ processElementAttrs 记录我方写入值，避免自触发死循环
-    old_attrs_head = """  function processElementAttrs(el) {
-    if (el[MARK]) return;"""
-    new_attrs_head = """  var __zhAttrWritten = (typeof WeakMap === 'function') ? new WeakMap() : null;
-  function processElementAttrs(el) {
-    if (el[MARK]) return;
-    var __written = __zhAttrWritten ? __zhAttrWritten.get(el) : null;"""
-    if old_attrs_head in src:
-        src = src.replace(old_attrs_head, new_attrs_head)
-        applied.append("③ 引入 WeakMap 记录已写入属性值")
+    def evaluate(self, port, target_id, expression, timeout=10):
+        item = self._conns.get(target_id)
+        if item and item[0] == port:
+            ws = item[1]
+            try:
+                ws.sock.settimeout(timeout)
+                return ws.evaluate(expression)
+            except Exception:
+                self._drop(target_id)
+        elif item:
+            self._drop(target_id)
 
-    old_attrs_set = """          el.setAttribute(attrs[i], DICT[trimmed]);"""
-    new_attrs_set = """          var __next = DICT[trimmed];
-          if (__written && __written[attrs[i]] === __next) continue;   // 我方写入，跳过
-          if (__zhAttrWritten) {
-            if (!__written) { __written = {}; __zhAttrWritten.set(el, __written); }
-            __written[attrs[i]] = __next;
-          }
-          el.setAttribute(attrs[i], __next);"""
-    if old_attrs_set in src:
-        src = src.replace(old_attrs_set, new_attrs_set)
-        applied.append("③ 写入前比对，防止 attributes 回调自触发死循环")
+        ws = MiniWS("127.0.0.1", port, f"/devtools/page/{target_id}", timeout=timeout)
+        try:
+            res = ws.evaluate(expression)
+            self._conns[target_id] = (port, ws)
+            return res
+        except Exception:
+            ws.close()
+            raise
 
-    # ④ 暴露只读状态，便于 doctor/agyctl 观测（不影响翻译行为）
-    old_tail = "  console.log('[汉化] Antigravity 汉化已激活，词典词条数: ' + dictSize);"
-    new_tail = """  window.__agy_dict = DICT;
-  window.__agy_zh_stats = { engine: 'observer(patched)', dictSize: dictSize,
-                            watchingAttributes: true, strict: true };
-  console.log('[汉化] Antigravity 汉化已激活（行内补丁版），词典词条数: ' + dictSize);"""
-    if old_tail in src:
-        src = src.replace(old_tail, new_tail)
-        applied.append("④ 暴露 __agy_dict / __agy_zh_stats 供诊断工具观测")
+    def retain(self, active_target_ids):
+        active = set(active_target_ids)
+        for tid in list(self._conns.keys()):
+            if tid not in active:
+                self._drop(tid)
 
-    return src, applied
+    def clear(self):
+        for tid in list(self._conns.keys()):
+            self._drop(tid)
 
 
-# ============================================================
-# ============================================================
-# 连接与注入
-# ============================================================
-# ============================================================
+_WS_POOL = WSPool()
+
 
 def get_port():
     if not DEVTOOLS_PORT_FILE.exists():
@@ -137,24 +110,51 @@ def get_port():
         return None
 
 
+def verify_cdp_server(port):
+    """校验本地 127.0.0.1 CDP 端口确实属于 Chromium/Electron/Antigravity 宿主。"""
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        conn.request("GET", "/json/version")
+        raw = conn.getresponse().read()
+        conn.close()
+        info = json.loads(raw)
+        browser = str(info.get("Browser") or "")
+        return any(k in browser for k in ("Chrome", "Electron", "Antigravity"))
+    except Exception:
+        return False
+
+
+def is_antigravity_page(target):
+    """严格筛选 Antigravity 主界面页面，排除 DevTools、扩展与空白占位页。"""
+    if target.get("type") != "page":
+        return False
+    url = (target.get("url") or "").strip()
+    if not url:
+        return False
+    blocked_prefixes = ("data:", "about:", "devtools://", "chrome://", "chrome-extension://", "view-source:")
+    if url.startswith(blocked_prefixes):
+        return False
+    allowed_prefixes = ("http://127.0.0.1", "http://localhost", "https://127.0.0.1", "https://localhost", "app://", "vscode-file://", "file://")
+    if url.startswith(allowed_prefixes):
+        return True
+    # 兜底：若标题包含 Antigravity 也允许注入
+    title = target.get("title") or ""
+    return "Antigravity" in title
+
+
 def get_pages(port):
-    import http.client
     try:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
         conn.request("GET", "/json/list")
         data = json.loads(conn.getresponse().read())
         conn.close()
-        return [t for t in data if t.get("type") == "page"]
+        return [t for t in data if is_antigravity_page(t)]
     except Exception:
         return []
 
 
 def inject(port, target_id, script):
-    ws = MiniWS("127.0.0.1", port, f"/devtools/page/{target_id}", timeout=15)
-    try:
-        ws.evaluate(script)
-    finally:
-        ws.close()
+    _WS_POOL.evaluate(port, target_id, script, timeout=15)
 
 
 def probe(port, target_id):
@@ -181,11 +181,7 @@ def probe(port, target_id):
         });
     })()"""
     try:
-        ws = MiniWS("127.0.0.1", port, f"/devtools/page/{target_id}", timeout=10)
-        try:
-            r = ws.evaluate(expr)
-        finally:
-            ws.close()
+        r = _WS_POOL.evaluate(port, target_id, expr, timeout=4)
     except Exception:
         return None
     if isinstance(r, dict):
@@ -199,30 +195,18 @@ def probe(port, target_id):
 
 
 def engine_version(script):
-    """从注入脚本里读出引擎版本戳。
-
-    注意：不能用 r"version:\\s*'([^']+)'" —— `version: ENGINE_VERSION` 的行
-    在 "version:" 之后不是引号，正则（回溯 + \\s*）会一路滑到后面词典内容里的
-    某个 `'...'`，解析出错误的版本号。必须精确锚定常量定义。
-    """
-    m = __import__("re").search(r"ENGINE_VERSION\s*=\s*'([^']+)'", script)
+    """从注入脚本里读出引擎版本戳（精确锚定常量定义）。"""
+    m = re.search(r"ENGINE_VERSION\s*=\s*'([^']+)'", script)
     return m.group(1) if m else None
 
 
 def force_upgrade(port, target_id):
-    """删除页面里的幂等标记与 observer_plus 记录，让新引擎能重新装上去。
-    只清标记，不动页面内容（旧 observer 会与一个空 document.body 的镜像共享状态，
-    但新引擎接管后所有节点以新记录为准，不会重复改写文本）。
-    """
+    """删除页面里的幂等标记，让新引擎热替换接管（无需刷新页面）。"""
     expr = """(() => {
         try { delete window.__agy_zh_injected; } catch (e) { window.__agy_zh_injected = false; }
         return 'ok';
     })()"""
-    ws = MiniWS("127.0.0.1", port, f"/devtools/page/{target_id}", timeout=10)
-    try:
-        ws.evaluate(expr)
-    finally:
-        ws.close()
+    _WS_POOL.evaluate(port, target_id, expr, timeout=10)
 
 
 # ============================================================
@@ -230,7 +214,6 @@ def force_upgrade(port, target_id):
 # ============================================================
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
-_USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
 
 
 def parse_iso_ts(ts_str):
@@ -278,43 +261,83 @@ def format_model_name(model_id):
     return " ".join(words) + suffix
 
 
-def extract_user_snippet(content):
-    """从 USER_INPUT 正文中提取用户真实输入片段，用于前端匹配当前对话。"""
-    if not content or not isinstance(content, str):
-        return ""
-    m = _USER_REQ_RE.search(content)
-    text = m.group(1) if m else content
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:36]
+def _slim_step(rec):
+    """提取指标计算所需的最小数值与时间字段，绝不读取或缓存用户聊天正文。"""
+    stype = rec.get("type")
+    source = rec.get("source")
+    slim = {
+        "type": stype,
+        "source": source,
+        "created_at": rec.get("created_at"),
+        "status": rec.get("status"),
+    }
+    if source == "MODEL" and ("input_tokens" in rec or "output_tokens" in rec):
+        slim["is_model"] = True
+        slim["model"] = rec.get("model")
+        slim["input_tokens"] = rec.get("input_tokens")
+        slim["cache_read_tokens"] = rec.get("cache_read_tokens")
+        slim["output_tokens"] = rec.get("output_tokens")
+        slim["step_index"] = rec.get("step_index")
+        slim["has_tools"] = bool(rec.get("tool_calls")) or ("tool_calls" in (rec.get("truncated_fields") or []))
+    return slim
+
+
+def _prune_transcript_cache():
+    if len(_TRANSCRIPT_CACHE) <= MAX_CACHE_CONVS:
+        return
+    ordered = sorted(_TRANSCRIPT_CACHE.items(), key=lambda kv: kv[1].get("accessed", 0.0))
+    evict_ids = set(cid for cid, _ in ordered[: len(ordered) - MAX_CACHE_CONVS])
+    for cid in evict_ids:
+        _TRANSCRIPT_CACHE.pop(cid, None)
+    for key in list(_STEP_END_TS.keys()):
+        if key[0] in evict_ids:
+            _STEP_END_TS.pop(key, None)
 
 
 def parse_transcript_metrics(conv_id, transcript_path):
-    """增量解析单个会话的 transcript.jsonl，返回上下文占用与 Token 生成速度指标。"""
+    """按字节偏移增量解析单个会话的 transcript.jsonl，返回上下文占用与 Token 生成速度指标。"""
     try:
         st = transcript_path.stat()
     except OSError:
         return None
 
+    now_ts = time.time()
     cached = _TRANSCRIPT_CACHE.get(conv_id)
     if cached and cached["mtime_ns"] == st.st_mtime_ns and cached["size"] == st.st_size:
+        cached["accessed"] = now_ts
         return cached["metrics"]
 
-    steps = []
+    steps = None
+    start_offset = 0
+    if cached and cached.get("inode") == st.st_ino and st.st_size >= cached.get("offset", 0):
+        steps = list(cached.get("steps") or [])
+        start_offset = cached.get("offset", 0)
+    else:
+        steps = []
+
+    new_offset = start_offset
     try:
-        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
+        with open(transcript_path, "rb") as f:
+            if start_offset > 0:
+                f.seek(start_offset)
+            while True:
+                line_bytes = f.readline()
+                if not line_bytes:
+                    break
+                # 仅推进到完整换行符位置，避免读取写入中的半行 JSON
+                if not line_bytes.endswith(b"\n"):
+                    break
+                new_offset = f.tell()
+                line = line_bytes.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
                 try:
-                    steps.append(json.loads(line))
+                    steps.append(_slim_step(json.loads(line)))
                 except ValueError:
                     continue
     except OSError:
         return None
 
-    first_snippet = ""
-    last_snippet = ""
     model_raw = ""
     last_ctx = 0
     last_in = 0
@@ -373,13 +396,8 @@ def parse_transcript_metrics(conv_id, transcript_path):
             turn_start_ts = parse_iso_ts(step.get("created_at"))
             turn_end_ts = None
             turn_last_ctx = 0
-            snip = extract_user_snippet(step.get("content"))
-            if snip:
-                if not first_snippet:
-                    first_snippet = snip
-                last_snippet = snip
 
-        if source == "MODEL" and ("input_tokens" in step or "output_tokens" in step):
+        if step.get("is_model"):
             model_steps += 1
             step_in_turn += 1
             turn_steps += 1
@@ -398,7 +416,7 @@ def parse_transcript_metrics(conv_id, transcript_path):
             total_out += out_tok
             turn_out_sum += out_tok
 
-            has_tools = bool(step.get("tool_calls")) or ("tool_calls" in (step.get("truncated_fields") or []))
+            has_tools = bool(step.get("has_tools"))
             step_idx = step.get("step_index", idx)
             start_ts = parse_iso_ts(step.get("created_at"))
             if turn_start_ts is None and start_ts is not None:
@@ -520,16 +538,19 @@ def parse_transcript_metrics(conv_id, transcript_path):
             avg_ctx_per_turn = int(turn_end_ctxs[0])
 
         last_rec = steps[-1] if steps else {}
-        last_has_tools = bool(last_rec.get("tool_calls")) or ("tool_calls" in (last_rec.get("truncated_fields") or []))
+        last_has_tools = bool(last_rec.get("has_tools"))
         is_final_reply = (last_rec.get("source") == "MODEL" and last_rec.get("status") == "DONE" and not last_has_tools)
         raw_incomplete = not is_final_reply
+
+        last_turn_e2e_tps = None
+        if last_turn_duration and last_turn_duration > 0.5 and last_turn_out > 0:
+            cand_e2e = round(last_turn_out / last_turn_duration, 1)
+            if cand_e2e <= 600:
+                last_turn_e2e_tps = cand_e2e
 
         metrics = {
             "convId": conv_id,
             "convShort": conv_id[:8],
-            "isUserConv": bool(first_snippet),
-            "firstSnippet": first_snippet,
-            "lastSnippet": last_snippet,
             "modelRaw": model_raw,
             "modelName": format_model_name(model_raw),
             "contextLimit": infer_context_limit(model_raw),
@@ -543,6 +564,7 @@ def parse_transcript_metrics(conv_id, transcript_path):
             "avgTps": avg_tps,
             "peakTps": peak_tps,
             "lastTurnAvgTps": last_turn_avg_tps,
+            "lastTurnE2eTps": last_turn_e2e_tps,
             "lastTurnOutputTokens": last_turn_out,
             "lastTurnSteps": last_turn_steps,
             "lastTurnDurationSec": last_turn_duration,
@@ -558,107 +580,67 @@ def parse_transcript_metrics(conv_id, transcript_path):
         }
 
     _TRANSCRIPT_CACHE[conv_id] = {
+        "inode": st.st_ino,
+        "offset": new_offset,
         "mtime_ns": st.st_mtime_ns,
         "size": st.st_size,
+        "steps": steps,
         "metrics": metrics,
+        "accessed": now_ts,
     }
+    _prune_transcript_cache()
     return metrics
 
 
-def _get_recent_brain_dirs():
-    """扫描 brain 目录下的活跃会话，按 transcript 修改时间倒序缓存前 20 个。"""
-    if not BRAIN_DIR.exists():
-        return []
-    now = time.time()
-    try:
-        dir_st = BRAIN_DIR.stat()
-    except OSError:
-        return []
-
-    if (
-        _BRAIN_SCAN_CACHE["dirs"]
-        and _BRAIN_SCAN_CACHE["mtime_ns"] == dir_st.st_mtime_ns
-        and (now - _BRAIN_SCAN_CACHE["checked_at"]) < 5.0
-    ):
-        return _BRAIN_SCAN_CACHE["dirs"]
-
-    items = []
-    try:
-        with os.scandir(BRAIN_DIR) as it:
-            for entry in it:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                if not _UUID_RE.match(entry.name):
-                    continue
-                tp = Path(entry.path) / ".system_generated" / "logs" / "transcript.jsonl"
-                try:
-                    st = tp.stat()
-                    items.append((st.st_mtime, entry.name, tp))
-                except OSError:
-                    continue
-    except OSError:
-        return []
-
-    items.sort(key=lambda x: x[0], reverse=True)
-    top = [(cid, tp) for _, cid, tp in items[:20]]
-    _BRAIN_SCAN_CACHE["mtime_ns"] = dir_st.st_mtime_ns
-    _BRAIN_SCAN_CACHE["checked_at"] = now
-    _BRAIN_SCAN_CACHE["dirs"] = top
-    return top
-
-
 def build_metrics_payload(target_conv_id=None):
-    """汇总当前及近期活跃会话指标，返回 JSON 字符串。
+    """仅精确解析当前路由对应的单个会话指标，零多余目录扫描与历史会话解析。
 
     关键约束：绝不把其它会话的数据伪装成当前会话的 primary。
-    - 当 target_conv_id 为空（新建空白对话页）时，primary 严格为 None；
-    - 当 target_conv_id 有值但磁盘尚无对应模型日志时，primary 也严格为 None。
+    - 当 target_conv_id 为空（新建空白对话页）时，直接零磁盘 I/O 返回空 payload；
+    - 当 target_conv_id 有值时，仅增量解析该会话的 transcript.jsonl。
     """
-    if not BRAIN_DIR.exists():
+    norm_target = target_conv_id.lower() if (target_conv_id and _UUID_RE.match(target_conv_id)) else None
+    if not norm_target or not BRAIN_DIR.exists():
         return json.dumps({
-            "targetConvId": target_conv_id,
+            "targetConvId": norm_target,
             "primary": None,
             "candidates": [],
         }, ensure_ascii=False, separators=(",", ":"))
 
-    dirs = list(_get_recent_brain_dirs())
-    norm_target = target_conv_id.lower() if (target_conv_id and _UUID_RE.match(target_conv_id)) else None
-    if norm_target:
-        if not any(cid.lower() == norm_target for cid, _ in dirs):
-            tp = BRAIN_DIR / norm_target / ".system_generated" / "logs" / "transcript.jsonl"
-            if tp.exists():
-                dirs.insert(0, (norm_target, tp))
-
-    now = time.time()
-    candidates = []
+    tp = BRAIN_DIR / norm_target / ".system_generated" / "logs" / "transcript.jsonl"
     target_metrics = None
-    for cid, tp in dirs[:12]:
-        m = parse_transcript_metrics(cid, tp)
-        if not m:
-            continue
-        m_copy = dict(m)
-        # 仅当日志最后一条未完结（如正在调工具或等待模型回复）且 120s 内有更新时，兜底判定为工作中
-        m_copy["isWorking"] = bool(m_copy.get("rawIncomplete") and (now - m_copy.get("mtimeSec", 0)) < 120)
-        candidates.append(m_copy)
-        if norm_target and cid.lower() == norm_target:
+    if tp.exists():
+        m = parse_transcript_metrics(norm_target, tp)
+        if m:
+            m_copy = dict(m)
+            # 仅当日志最后一条未完结（如正在调工具或等待模型回复）且 120s 内有更新时，兜底判定为工作中
+            m_copy["isWorking"] = bool(m_copy.get("rawIncomplete") and (time.time() - m_copy.get("mtimeSec", 0)) < 120)
             target_metrics = m_copy
 
-    candidates.sort(key=lambda m: m["updatedAt"], reverse=True)
     return json.dumps({
         "targetConvId": norm_target,
         "primary": target_metrics,
-        "candidates": candidates[:8],
+        "candidates": [target_metrics] if target_metrics else [],
     }, ensure_ascii=False, separators=(",", ":"))
 
 
 def push_metrics(port, target_id, payload_json):
-    """通过 CDP 将指标推入页面 HUD。"""
+    """通过复用的 CDP WebSocket 将指标推入页面 HUD。"""
     expr = f"if (typeof window.__agy_update_metrics === 'function') window.__agy_update_metrics({payload_json});"
-    ws = MiniWS("127.0.0.1", port, f"/devtools/page/{target_id}", timeout=8)
+    _WS_POOL.evaluate(port, target_id, expr, timeout=8)
+
+
+def _trim_log_file(path):
+    """防止日志文件长期追加无限膨胀：超过 MAX_LOG_BYTES 时截断保留尾部 KEEP_LOG_BYTES。"""
     try:
-        ws.evaluate(expr)
-    finally:
-        ws.close()
+        if path.exists() and path.stat().st_size > MAX_LOG_BYTES:
+            data = path.read_bytes()[-KEEP_LOG_BYTES:]
+            nl = data.find(b"\n")
+            if nl != -1:
+                data = data[nl + 1:]
+            path.write_bytes(data)
+    except OSError:
+        pass
 
 
 # ============================================================
@@ -672,27 +654,33 @@ def main():
     except Exception:
         pass
 
-    ap = argparse.ArgumentParser(description="Antigravity 汉化 · 增强引擎启动器")
+    ap = argparse.ArgumentParser(description=f"Antigravity 汉化 v{APP_VERSION} · 增强引擎守护进程")
     ap.add_argument("--engine", default="observer_plus.js",
-                    help="引擎文件（默认 observer_plus.js；可指定 observer.js）")
-    ap.add_argument("--patch", action="store_true",
-                    help="对指定引擎做行内补丁（用于在不改文件的前提下升级原版 observer.js）")
+                    help="引擎文件（默认 observer_plus.js）")
     ap.add_argument("--dict", default=str(DICT_FILE), help="词典文件")
     ap.add_argument("--source-dict", default=None, help="可选：额外监听的源词典路径（改动时自动热重载）")
     ap.add_argument("--once", action="store_true", help="只注入一次后退出")
-    ap.add_argument("--no-metrics", action="store_true", help="禁用上下文窗口与 Token 速度悬浮条数据推送")
+    ap.add_argument("--no-metrics", action="store_true", help="仅启用界面汉化，彻底禁用小组件挂载与本地日志读取")
+    ap.add_argument("--metrics-only", action="store_true", help="仅启用上下文/Token 速度小组件，保持原始英文界面")
     ap.add_argument("--log", help="把输出同时追加到该文件")
     args = ap.parse_args()
+    if args.no_metrics and args.metrics_only:
+        print("❌ --no-metrics 与 --metrics-only 不能同时指定")
+        return 1
 
-    out = sys.stdout
+    # 若以 LaunchAgent 运行，启动时也顺手检查默认 translate.log 大小
+    _trim_log_file(SCRIPT_DIR / "translate.log")
     logf = None
     if args.log:
-        logf = open(Path(args.log).expanduser(), "a", encoding="utf-8", buffering=1)
+        log_path = Path(args.log).expanduser()
+        _trim_log_file(log_path)
+        logf = open(log_path, "a", encoding="utf-8", buffering=1)
 
     def say(msg):
-        print(msg)
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}" if msg else ""
+        print(line)
         if logf:
-            logf.write(msg + "\n")
+            logf.write(line + "\n")
 
     engine_path = Path(args.engine)
     if not engine_path.is_absolute():
@@ -733,19 +721,23 @@ def main():
         raw_dict = json.loads(active_dict.read_text(encoding="utf-8"))
         raw_dict.pop("_meta", None)
         dict_json = json.dumps(raw_dict, ensure_ascii=False, separators=(",", ":"))
-        dict_sig = hashlib.sha256(dict_json.encode("utf-8")).hexdigest()[:8]
-
+        init_zh = "false" if args.metrics_only else "true"
+        init_hud = "false" if args.no_metrics else "true"
         src_text = engine_path.read_text(encoding="utf-8")
-        applied_patches = []
-        if args.patch:
-            src_text, applied_patches = patch_observer_source(src_text)
         if "%%DICT%%" not in src_text:
             raise ValueError(f"{engine_path.name} 缺少 %%DICT%% 占位符")
-        built = src_text.replace("%%DICT_SIG%%", dict_sig).replace("%%DICT%%", dict_json)
+        sig_seed = f"{dict_json}|zh={init_zh}|hud={init_hud}|{hashlib.sha256(src_text.encode('utf-8')).hexdigest()[:12]}".encode("utf-8")
+        dict_sig = hashlib.sha256(sig_seed).hexdigest()[:8]
+        built = (
+            src_text
+            .replace("%%DICT_SIG%%", dict_sig)
+            .replace("%%INIT_ZH%%", init_zh)
+            .replace("%%INIT_HUD%%", init_hud)
+            .replace("%%DICT%%", dict_json)
+        )
         return {
             "script": built,
             "entries_count": len(raw_dict),
-            "patched": applied_patches,
             "want_ver": engine_version(built),
             "dict_sig": dict_sig,
             "active_dict": active_dict,
@@ -760,20 +752,16 @@ def main():
         return 1
 
     script = bundle["script"]
-    patched = bundle["patched"]
 
+    mode_label = "仅监测（英文原版）" if args.metrics_only else ("仅汉化（无小组件）" if args.no_metrics else "汉化 + 模型监测")
     say("=" * 56)
-    say("  Antigravity 汉化 · 增强引擎启动器")
-    say("  非侵入式 · 纯本地 · 不修改任何原文件")
+    say(f"  Antigravity 汉化 v{APP_VERSION} · 增强引擎守护进程")
+    say(f"  运行模式: {mode_label}｜非侵入式 · 纯本地")
     say("=" * 56)
     say(f"📖 词典      : {bundle['active_dict'].name}（{bundle['entries_count']} 条，sig={bundle['dict_sig']}）")
     if source_dict_path and source_dict_path.exists():
         say(f"👀 热重载监听: {source_dict_path}")
-    say(f"📄 引擎      : {engine_path.name}"
-        + ("（已应用行内补丁）" if args.patch else "（原样使用）"))
-    if patched:
-        for p in patched:
-            say(f"   · {p}")
+    say(f"📄 引擎      : {engine_path.name}（ver={bundle['want_ver'] or '-'}）")
     say(f"🔍 端口文件  : {DEVTOOLS_PORT_FILE}")
     say("按 Ctrl+C 停止")
     say("-" * 56)
@@ -786,112 +774,167 @@ def main():
     want_dict_sig = bundle["dict_sig"]
     last_port = None
     last_reload_check = time.time()
+    last_active_at = time.time()
+    last_wall_ts = time.time()
+    cached_pages = []
+    last_pages_at = 0.0
 
-    while True:
-        try:
-            now_ts = time.time()
-            if now_ts - last_reload_check >= 2.0:
-                last_reload_check = now_ts
-                cur_dict_path = resolve_active_dict_path()
-                if (
-                    cur_dict_path != bundle["active_dict"]
-                    or file_stamp(cur_dict_path) != bundle["dict_stamp"]
-                    or file_stamp(engine_path) != bundle["engine_stamp"]
-                ):
-                    try:
-                        new_bundle = load_bundle()
-                        bundle = new_bundle
-                        script = bundle["script"]
-                        want_ver = bundle["want_ver"]
-                        want_dict_sig = bundle["dict_sig"]
-                        say(f"♻️  检测到词典/引擎更新，热重载就绪（{bundle['entries_count']} 条，sig={want_dict_sig}，ver={want_ver}）")
-                    except Exception as e:
-                        say(f"⚠️  词典/引擎热重载解析失败（保留旧版运行）: {e}")
+    try:
+        while True:
+            try:
+                now_ts = time.time()
+                # 检测 Mac 合盖休眠唤醒（墙钟大幅跳跃 > 15s），主动清理半开连接池并刷新页面列表
+                if now_ts - last_wall_ts > 15.0:
+                    _WS_POOL.clear()
+                    last_pages_at = 0.0
+                    last_active_at = now_ts
+                last_wall_ts = now_ts
 
-            port = get_port()
-            if not port:
-                if last_port is not None:
-                    say("⏸  Antigravity 似乎已关闭，等待重新启动…")
-                    say("   提示：2.34 起须用「启动Antigravity（汉化）.command」启动"
-                        "（带 --remote-debugging-port），否则不会生成端口文件")
+                if now_ts - last_reload_check >= 2.0:
+                    last_reload_check = now_ts
+                    cur_dict_path = resolve_active_dict_path()
+                    if (
+                        cur_dict_path != bundle["active_dict"]
+                        or file_stamp(cur_dict_path) != bundle["dict_stamp"]
+                        or file_stamp(engine_path) != bundle["engine_stamp"]
+                    ):
+                        try:
+                            new_bundle = load_bundle()
+                            bundle = new_bundle
+                            script = bundle["script"]
+                            want_ver = bundle["want_ver"]
+                            want_dict_sig = bundle["dict_sig"]
+                            last_active_at = now_ts
+                            say(f"♻️  检测到词典/引擎更新，热重载就绪（{bundle['entries_count']} 条，sig={want_dict_sig}，ver={want_ver}）")
+                        except Exception as e:
+                            say(f"⚠️  词典/引擎热重载解析失败（保留旧版运行）: {e}")
+
+                port = get_port()
+                if not port:
+                    if last_port is not None:
+                        say("⏸  Antigravity 似乎已关闭，等待重新启动…")
+                        say("   提示：2.34 起须用「启动Antigravity（汉化）.command」启动"
+                            "（带 --remote-debugging-port），否则不会生成端口文件")
+                        doc_ids.clear()
+                        last_metrics_sig.clear()
+                        _WS_POOL.clear()
+                        cached_pages = []
+                        last_pages_at = 0.0
+                        last_port = None
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                if port != last_port:
+                    if not verify_cdp_server(port):
+                        time.sleep(POLL_INTERVAL)
+                        continue
+                    say(f"🔗 发现 Antigravity（127.0.0.1:{port}）" if last_port is None
+                        else f"🔄 Antigravity 已重启（{last_port} → {port}）")
                     doc_ids.clear()
                     last_metrics_sig.clear()
-                    last_port = None
-                time.sleep(POLL_INTERVAL)
-                continue
+                    _WS_POOL.clear()
+                    cached_pages = []
+                    last_pages_at = 0.0
+                    last_port = port
+                    last_active_at = now_ts
 
-            if port != last_port:
-                say(f"🔗 发现 Antigravity（端口 {port}）" if last_port is None
-                    else f"🔄 Antigravity 已重启（{last_port} → {port}）")
-                doc_ids.clear()
-                last_metrics_sig.clear()
-                last_port = port
+                # 节流拉取 /json/list：已有页面缓存且 <10s 时复用，减少无谓 HTTP 短连接
+                if not cached_pages or (now_ts - last_pages_at) >= PAGES_REFRESH_INTERVAL:
+                    cached_pages = get_pages(port)
+                    last_pages_at = now_ts
 
-            for t in get_pages(port):
-                url = t.get("url") or ""
-                if url.startswith("data:") or url == "about:blank":
-                    continue
-                tid = t["id"]
-                title = (t.get("title") or "未知页面")[:47]
+                valid_tids = []
+                any_activity = False
+                any_probe_failed = False
+                for t in cached_pages:
+                    url = t.get("url") or ""
+                    if url.startswith("data:") or url == "about:blank":
+                        continue
+                    tid = t["id"]
+                    valid_tids.append(tid)
+                    title = (t.get("title") or "未知页面")[:47]
 
-                info = probe(port, tid)
-                if info is None:
-                    continue                      # 页面瞬时不响应，下轮再试
-                doc = info.get("doc")
-                cur_ver = info.get("version")
-                cur_dict_sig = info.get("dictSig")
-                same_bundle = (cur_ver == want_ver) and (not cur_dict_sig or cur_dict_sig == want_dict_sig)
+                    info = probe(port, tid)
+                    if info is None:
+                        any_probe_failed = True
+                        continue                      # 页面瞬时不响应，下轮强制刷新列表重试
+                    doc = info.get("doc")
+                    cur_ver = info.get("version")
+                    cur_dict_sig = info.get("dictSig")
+                    same_bundle = (cur_ver == want_ver) and (not cur_dict_sig or cur_dict_sig == want_dict_sig)
 
-                # 同一文档 + 引擎在跑 + 版本与词典签名一致 → 仅按需增量推送上下文与速度指标
-                if info.get("engine") and doc_ids.get(tid) == doc and same_bundle:
-                    if not args.no_metrics and info.get("hasHud"):
-                        try:
-                            payload_json = build_metrics_payload(info.get("convId"))
-                            if payload_json:
-                                sig = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:16]
-                                if last_metrics_sig.get(tid) != sig:
+                    # 同一文档 + 引擎在跑 + 版本与词典签名一致 → 仅按需增量推送上下文与速度指标
+                    if info.get("engine") and doc_ids.get(tid) == doc and same_bundle:
+                        if not args.no_metrics and info.get("hasHud"):
+                            try:
+                                payload_json = build_metrics_payload(info.get("convId"))
+                                if payload_json:
+                                    if '"isWorking":true' in payload_json:
+                                        any_activity = True
+                                    sig = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:16]
+                                    if last_metrics_sig.get(tid) != sig:
+                                        push_metrics(port, tid, payload_json)
+                                        last_metrics_sig[tid] = sig
+                                        any_activity = True
+                            except Exception:
+                                any_probe_failed = True
+                        continue
+
+                    try:
+                        any_activity = True
+                        if info.get("engine") and not same_bundle:
+                            # 引擎版本或词典签名变化 → 清幂等标记后热替换（无需刷新页面）
+                            say(f"⬆️  热升级 {cur_ver or '(旧版)'}/{cur_dict_sig or '-'} → {want_ver}/{want_dict_sig}: {title}")
+                            force_upgrade(port, tid)
+                        inject(port, tid, script)
+                        doc_ids[tid] = doc
+                        last_metrics_sig.pop(tid, None)
+                        if info.get("engine"):
+                            say(f"🔁 文档已刷新/热重载，重新注入: {title}")
+                        else:
+                            say(f"✅ 已注入增强汉化: {title}")
+                        if not args.no_metrics:
+                            try:
+                                payload_json = build_metrics_payload(info.get("convId"))
+                                if payload_json:
                                     push_metrics(port, tid, payload_json)
-                                    last_metrics_sig[tid] = sig
-                        except Exception:
-                            pass
-                    continue
+                                    last_metrics_sig[tid] = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:16]
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        any_probe_failed = True
+                        say(f"⚠️  注入失败 ({tid[:8]}…): {e}")
 
-                try:
-                    if info.get("engine") and not same_bundle:
-                        # 引擎版本或词典签名变化 → 清幂等标记后热替换（无需刷新页面）
-                        say(f"⬆️  热升级 {cur_ver or '(旧版)'}/{cur_dict_sig or '-'} → {want_ver}/{want_dict_sig}: {title}")
-                        force_upgrade(port, tid)
-                    inject(port, tid, script)
-                    doc_ids[tid] = doc
-                    last_metrics_sig.pop(tid, None)
-                    if info.get("engine"):
-                        say(f"🔁 文档已刷新/热重载，重新注入: {title}")
-                    else:
-                        say(f"✅ 已注入增强汉化: {title}")
-                    if not args.no_metrics:
-                        try:
-                            payload_json = build_metrics_payload(info.get("convId"))
-                            if payload_json:
-                                push_metrics(port, tid, payload_json)
-                                last_metrics_sig[tid] = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:16]
-                        except Exception:
-                            pass
-                except Exception as e:
-                    say(f"⚠️  注入失败 ({tid[:8]}…): {e}")
+                if any_probe_failed:
+                    last_pages_at = 0.0
+                _WS_POOL.retain(valid_tids)
+                if any_activity:
+                    last_active_at = time.time()
 
-            if args.once:
-                say("--once 指定：注入完成，退出。")
+                if args.once:
+                    say("--once 指定：注入完成，退出。")
+                    return 0
+                idle_for = time.time() - last_active_at
+                if idle_for < 12.0:
+                    sleep_sec = ACTIVE_POLL_INTERVAL
+                elif idle_for < 35.0:
+                    sleep_sec = IDLE_POLL_INTERVAL
+                else:
+                    sleep_sec = DEEP_IDLE_POLL_INTERVAL
+                time.sleep(sleep_sec)
+
+            except KeyboardInterrupt:
+                say("")
+                say("👋 已停止。提示：页面内已注入的脚本会继续运行，")
+                say("   如需恢复英文，可在小组件弹窗点击「中」原地切换，或按 Cmd+R 刷新页面。")
                 return 0
-            time.sleep(ACTIVE_POLL_INTERVAL)
-
-        except KeyboardInterrupt:
-            say("")
-            say("👋 已停止。注意：页面内已注入的脚本会继续运行，")
-            say("   要完全恢复英文请刷新页面（Cmd+R）——原版 README 说 Ctrl+C 即恢复，实际不成立。")
-            return 0
-        except Exception as e:
-            say(f"⚠️  错误: {e}")
-            time.sleep(POLL_INTERVAL)
+            except Exception as e:
+                say(f"⚠️  错误: {e}")
+                time.sleep(POLL_INTERVAL)
+    finally:
+        _WS_POOL.clear()
+        if logf:
+            logf.close()
 
 
 if __name__ == "__main__":
