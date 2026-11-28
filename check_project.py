@@ -8,6 +8,8 @@ Antigravity 汉化 — 项目质量自检脚本（纯标准库，零外部依赖
 import json
 import py_compile
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -66,18 +68,36 @@ def check_dict():
     if efforts:
         warn(f"以下思考档位在 dict.json 中被翻译（按约定应保持英文）: {efforts}")
 
+    # 4. 检查冗余 HTML 实体键
+    html_entities = [k for k in entries if re.search(r"&(?:amp|lt|gt|quot|nbsp);", k)]
+    if html_entities:
+        warn(f"dict.json 含 {len(html_entities)} 条 HTML 实体键（DOM textContent 已解码，通常冗余）: {html_entities[:5]}")
+
 
 def check_js():
     p = ROOT / "observer_plus.js"
     src = p.read_text(encoding="utf-8")
-    for token in ("%%DICT%%", "%%DICT_SIG%%", "%%INIT_ZH%%", "%%INIT_HUD%%", "ENGINE_VERSION"):
+    for token in ("%%DICT%%", "%%DICT_SIG%%", "%%INIT_ZH%%", "%%INIT_HUD%%", "%%MODEL_LIMITS%%", "ENGINE_VERSION"):
         if token not in src:
             fail(f"observer_plus.js 缺少关键标记: {token}")
+    dict_occurrences = src.count("%%DICT%%")
+    if dict_occurrences != 1:
+        fail(f"observer_plus.js 中 %%DICT%% 应仅在尾部出现 1 次，实际出现 {dict_occurrences} 次（会重复注入整份词典）")
+    else:
+        ok("observer_plus.js 中 %%DICT%% 仅出现 1 次（无重复注入风险）")
+
     m = re.search(r"ENGINE_VERSION\s*=\s*'([^']+)'", src)
     if not m:
         fail("observer_plus.js 无法提取 ENGINE_VERSION")
     else:
-        ok(f"observer_plus.js 标记完整（ENGINE_VERSION={m.group(1)}）")
+        eng_ver = m.group(1)
+        ok(f"observer_plus.js 标记完整（ENGINE_VERSION={eng_ver}）")
+        rop_src = (ROOT / "run_observer_plus.py").read_text(encoding="utf-8")
+        m_app = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', rop_src)
+        if m_app and m_app.group(1) != eng_ver:
+            fail(f"版本号不一致：run_observer_plus.py={m_app.group(1)} vs observer_plus.js={eng_ver}")
+        elif m_app:
+            ok(f"版本号一致（v{eng_ver}）")
 
     if not src.strip().endswith("(%%DICT%%);"):
         fail("observer_plus.js 结尾不符合 IIFE 契约 '(%%DICT%%);'")
@@ -86,6 +106,71 @@ def check_js():
         fail("缺少 uninstall.sh 卸载脚本")
     else:
         ok("uninstall.sh 就绪")
+
+
+def check_shell_scripts():
+    scripts = sorted(list(ROOT.glob("*.sh")) + list(ROOT.glob("*.command")))
+    if not scripts:
+        warn("未找到任何 .sh / .command 脚本")
+        return
+    bash_bin = shutil.which("bash") or "/bin/bash"
+    for sp in scripts:
+        r = subprocess.run([bash_bin, "-n", str(sp)], capture_output=True, text=True)
+        if r.returncode != 0:
+            fail(f"{sp.name} Bash 语法错误: {(r.stderr or r.stdout).strip()}")
+        else:
+            ok(f"{sp.name} Bash 语法检查通过")
+
+
+def check_bundle_and_js_syntax():
+    sys.path.insert(0, str(ROOT))
+    import run_observer_plus as rop
+
+    engine_path = ROOT / "observer_plus.js"
+    dict_path = ROOT / "dict.json"
+    bundle = rop.build_injection_bundle(engine_path, dict_path)
+    built = bundle["script"]
+    for tok in ("%%DICT%%", "%%DICT_SIG%%", "%%INIT_ZH%%", "%%INIT_HUD%%", "%%MODEL_LIMITS%%"):
+        if tok in built:
+            fail(f"打包后的注入脚本仍残留未替换占位符: {tok}")
+            return
+
+    # 回归验证：即使词典含 */ 字符，也绝不会破坏顶部注释或导致 JS 语法错误
+    with tempfile.TemporaryDirectory() as td:
+        tmp_dict = Path(td) / "dict.json"
+        tmp_dict.write_text(json.dumps({"Test */ glob": "测试 */ 通配符"}, ensure_ascii=False), encoding="utf-8")
+        safe_bundle = rop.build_injection_bundle(engine_path, tmp_dict)
+        if safe_bundle["script"].count("测试 */ 通配符") != 1:
+            fail("词典打包校验失败：测试词条注入次数异常")
+            return
+
+        tmp_js = Path(td) / "bundle.js"
+        tmp_js.write_text(built, encoding="utf-8")
+        tmp_safe_js = Path(td) / "safe_bundle.js"
+        tmp_safe_js.write_text(safe_bundle["script"], encoding="utf-8")
+
+        node_bin = shutil.which("node")
+        jsc_bin = "/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc"
+        if node_bin:
+            for label, fp in (("完整注入包", tmp_js), ("含 */ 词典回归包", tmp_safe_js)):
+                r = subprocess.run([node_bin, "--check", str(fp)], capture_output=True, text=True)
+                if r.returncode != 0:
+                    fail(f"{label} JS 语法错误（node --check）: {(r.stderr or r.stdout).strip()}")
+                    return
+            ok(f"JS 注入包语法校验通过（node --check，体积 {len(built.encode('utf-8')) // 1024} KB）")
+        elif Path(jsc_bin).exists():
+            for label, fp in (("完整注入包", tmp_js), ("含 */ 词典回归包", tmp_safe_js)):
+                r = subprocess.run(
+                    [jsc_bin, "-e", "checkSyntax(arguments[0]);", "--", str(fp)],
+                    capture_output=True,
+                    text=True,
+                )
+                if r.returncode != 0:
+                    fail(f"{label} JS 语法错误（jsc）: {(r.stderr or r.stdout).strip()}")
+                    return
+            ok(f"JS 注入包语法校验通过（jsc，体积 {len(built.encode('utf-8')) // 1024} KB）")
+        else:
+            warn("未找到 node 或 jsc，跳过 JS 语法解析检查")
 
 
 def check_python():
@@ -151,6 +236,8 @@ def main():
     check_dict()
     check_js()
     check_python()
+    check_shell_scripts()
+    check_bundle_and_js_syntax()
     check_incremental_parser()
     print("-" * 48)
     if ERRORS:

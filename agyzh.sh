@@ -13,12 +13,13 @@
 #   只要 ①停掉自动注入 ②让页面刷新一次 —— 页面自然回到纯英文。
 #   「切中文」同理：①恢复自动注入 ②刷新页面，引擎按最新词典整页重翻。
 #
-# 不想刷新？可以用 --soft：只停/启翻译，不要求刷新（会有残留，属已知取舍）
+# 不想刷新？可以直接点击输入框底部小组件弹窗右上角的「中 / EN」按钮原地免刷新切换。
 set -euo pipefail
 
 LABEL="local.antigravity-zh"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 AGY_DIR="$HOME/.antigravity-zh"
+PROC_PATTERN="antigravity-zh/run_observer_plus\.py"
 MODE="${1:-toggle}"
 UID_NUM="$(id -u)"
 # 状态文件放工作区：部署目录受系统保护，普通写会 EPERM
@@ -27,11 +28,11 @@ STATE_FILE="$(cd "$(dirname "$0")" && pwd)/.agyzh-state"   # on / off
 read_state() {
   if [ -f "$STATE_FILE" ]; then cat "$STATE_FILE"; else
     # 没记录过：以进程是否存在推断
-    pgrep -f "antigravity-zh/" >/dev/null 2>&1 && echo "on" || echo "off"
+    pgrep -f "$PROC_PATTERN" >/dev/null 2>&1 && echo "on" || echo "off"
   fi
 }
 
-agent_running() { pgrep -f "antigravity-zh/" >/dev/null 2>&1; }
+agent_running() { pgrep -f "$PROC_PATTERN" >/dev/null 2>&1; }
 
 case "$MODE" in
   toggle)
@@ -67,12 +68,11 @@ case "$MODE" in
     launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
     sleep 1
     ERR="$(mktemp)"
-    OK=0
-    for cmd in "launchctl bootstrap gui/$UID_NUM $PLIST" \
-               "launchctl load -w $PLIST" \
-               "launchctl kickstart gui/$UID_NUM/$LABEL"; do
-      if $cmd 2>"$ERR"; then OK=1; break; fi
-    done
+    if launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>"$ERR" \
+       || launchctl load -w "$PLIST" 2>>"$ERR" \
+       || launchctl kickstart "gui/$UID_NUM/$LABEL" 2>>"$ERR"; then
+      :
+    fi
     sleep 3
 
     if agent_running; then
@@ -105,11 +105,13 @@ case "$MODE" in
       echo "  ⚠️ 两者不一致：可能是 launchctl 被系统拦住。重新双击对应按钮，或看 AGY 日志。"
     fi
     if [ -f "$AGY_DIR/dict.json" ]; then
-      N=$(python3 -c "
-import json
+      N=$(python3 - "$AGY_DIR/dict.json" <<'PY' 2>/dev/null || echo "?"
+import json, sys
 from pathlib import Path
-d=json.loads(Path('$AGY_DIR/dict.json').read_text(encoding='utf-8'))
-print(len([k for k in d if not k.startswith('_')]))" 2>/dev/null || echo "?")
+d = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(len([k for k in d if not k.startswith("_")]))
+PY
+)
       echo "  词典条数 : $N"
     fi
     ;;

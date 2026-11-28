@@ -22,6 +22,8 @@ from datetime import datetime
 import hashlib
 import http.client
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import signal
@@ -33,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.resolve()))
 from doctor import MiniWS, DEVTOOLS_PORT_FILE, DICT_FILE  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 POLL_INTERVAL = 6.0
 ACTIVE_POLL_INTERVAL = 0.8
 IDLE_POLL_INTERVAL = 2.4
@@ -43,6 +45,16 @@ BRAIN_DIR = Path.home() / ".gemini" / "antigravity" / "brain"
 MAX_CACHE_CONVS = 64
 MAX_LOG_BYTES = 2 * 1024 * 1024
 KEEP_LOG_BYTES = 512 * 1024
+
+# 模型上下文窗口容量上限（单点维护，同步注入到前端 observer_plus.js）
+MODEL_CONTEXT_LIMITS = [
+    ["claude", 200000],
+    ["flash", 256000],
+    ["gpt", 272000],
+    ["neon", 512000],
+]
+DEFAULT_CONTEXT_LIMIT = 1000000
+CONTEXT_CAP_PRESETS = [0, 1000000, 512000, 272000, 256000, 200000]
 
 _TRANSCRIPT_CACHE = {}
 _STEP_END_TS = {}
@@ -112,16 +124,22 @@ def get_port():
 
 def verify_cdp_server(port):
     """校验本地 127.0.0.1 CDP 端口确实属于 Chromium/Electron/Antigravity 宿主。"""
+    conn = None
     try:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
         conn.request("GET", "/json/version")
         raw = conn.getresponse().read()
-        conn.close()
         info = json.loads(raw)
         browser = str(info.get("Browser") or "")
         return any(k in browser for k in ("Chrome", "Electron", "Antigravity"))
     except Exception:
         return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def is_antigravity_page(target):
@@ -143,14 +161,20 @@ def is_antigravity_page(target):
 
 
 def get_pages(port):
+    conn = None
     try:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
         conn.request("GET", "/json/list")
         data = json.loads(conn.getresponse().read())
-        conn.close()
         return [t for t in data if is_antigravity_page(t)]
     except Exception:
         return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def inject(port, target_id, script):
@@ -232,15 +256,10 @@ def parse_iso_ts(ts_str):
 def infer_context_limit(model_id):
     """根据模型标识推断 Antigravity 中的活跃上下文窗口上限（Tokens）。"""
     m = (model_id or "").lower()
-    if "claude" in m:
-        return 200000
-    if "flash" in m:
-        return 256000
-    if "gpt" in m:
-        return 272000
-    if "neon" in m:
-        return 512000
-    return 1000000
+    for key, limit in MODEL_CONTEXT_LIMITS:
+        if key in m:
+            return limit
+    return DEFAULT_CONTEXT_LIMIT
 
 
 def format_model_name(model_id):
@@ -268,7 +287,7 @@ def _slim_step(rec):
     slim = {
         "type": stype,
         "source": source,
-        "created_at": rec.get("created_at"),
+        "ts": parse_iso_ts(rec.get("created_at")),
         "status": rec.get("status"),
     }
     if source == "MODEL" and ("input_tokens" in rec or "output_tokens" in rec):
@@ -307,10 +326,11 @@ def parse_transcript_metrics(conv_id, transcript_path):
         cached["accessed"] = now_ts
         return cached["metrics"]
 
-    steps = None
     start_offset = 0
     if cached and cached.get("inode") == st.st_ino and st.st_size >= cached.get("offset", 0):
-        steps = list(cached.get("steps") or [])
+        steps = cached.get("steps")
+        if steps is None:
+            steps = []
         start_offset = cached.get("offset", 0)
     else:
         steps = []
@@ -393,7 +413,7 @@ def parse_transcript_metrics(conv_id, transcript_path):
             turn_timed_out_sum = 0
             turn_timed_dt_sum = 0.0
             turn_last_tps = None
-            turn_start_ts = parse_iso_ts(step.get("created_at"))
+            turn_start_ts = step.get("ts")
             turn_end_ts = None
             turn_last_ctx = 0
 
@@ -418,7 +438,7 @@ def parse_transcript_metrics(conv_id, transcript_path):
 
             has_tools = bool(step.get("has_tools"))
             step_idx = step.get("step_index", idx)
-            start_ts = parse_iso_ts(step.get("created_at"))
+            start_ts = step.get("ts")
             if turn_start_ts is None and start_ts is not None:
                 turn_start_ts = start_ts
             end_ts = None
@@ -435,21 +455,21 @@ def parse_transcript_metrics(conv_id, transcript_path):
                         nsrc = nxt.get("source")
                         if ntype == "USER_INPUT" or nsrc == "USER_EXPLICIT":
                             break
-                        if nsrc == "MODEL" and ("input_tokens" in nxt or "output_tokens" in nxt):
+                        if nxt.get("is_model"):
                             break
                         if ntype == "GENERIC":
-                            ts_k = parse_iso_ts(nxt.get("created_at"))
+                            ts_k = nxt.get("ts")
                             if ts_k is not None:
                                 last_tool_ts = ts_k
                         elif last_tool_ts is None:
-                            ts_k = parse_iso_ts(nxt.get("created_at"))
+                            ts_k = nxt.get("ts")
                             if ts_k is not None:
                                 last_tool_ts = ts_k
                     end_ts = last_tool_ts
                 else:
                     nxt = steps[idx + 1]
                     if nxt.get("type") != "USER_INPUT" and nxt.get("source") != "USER_EXPLICIT":
-                        end_ts = parse_iso_ts(nxt.get("created_at"))
+                        end_ts = nxt.get("ts")
                     else:
                         end_ts = _STEP_END_TS.get((conv_id, step_idx))
             elif step.get("status") == "DONE":
@@ -630,8 +650,58 @@ def push_metrics(port, target_id, payload_json):
     _WS_POOL.evaluate(port, target_id, expr, timeout=8)
 
 
+def _file_stamp(p):
+    try:
+        st = p.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def build_injection_bundle(engine_path, active_dict_path, metrics_only=False, no_metrics=False):
+    """构建最终注入 JS 载荷：精准单次替换末尾 (%%DICT%%);，避免注释中的占位符被误替换。"""
+    raw_dict = json.loads(active_dict_path.read_text(encoding="utf-8"))
+    raw_dict.pop("_meta", None)
+    dict_json = json.dumps(raw_dict, ensure_ascii=False, separators=(",", ":"))
+    init_zh = "false" if metrics_only else "true"
+    init_hud = "false" if no_metrics else "true"
+    model_limits_json = json.dumps({
+        "rules": MODEL_CONTEXT_LIMITS,
+        "defaultLimit": DEFAULT_CONTEXT_LIMIT,
+        "presets": CONTEXT_CAP_PRESETS,
+    }, ensure_ascii=False, separators=(",", ":"))
+    src_text = engine_path.read_text(encoding="utf-8")
+    dict_marker = "(%%DICT%%);"
+    marker_pos = src_text.rfind(dict_marker)
+    if marker_pos == -1:
+        raise ValueError(f"{engine_path.name} 缺少末尾 {dict_marker} 占位符")
+    sig_seed = (
+        f"{dict_json}|zh={init_zh}|hud={init_hud}|limits={model_limits_json}"
+        f"|{hashlib.sha256(src_text.encode('utf-8')).hexdigest()[:12]}"
+    ).encode("utf-8")
+    dict_sig = hashlib.sha256(sig_seed).hexdigest()[:8]
+    head = (
+        src_text[:marker_pos]
+        .replace("%%DICT_SIG%%", dict_sig)
+        .replace("%%INIT_ZH%%", init_zh)
+        .replace("%%INIT_HUD%%", init_hud)
+        .replace("%%MODEL_LIMITS%%", model_limits_json)
+    )
+    tail = src_text[marker_pos + len(dict_marker):]
+    built = f"{head}({dict_json});{tail}"
+    return {
+        "script": built,
+        "entries_count": len(raw_dict),
+        "want_ver": engine_version(built),
+        "dict_sig": dict_sig,
+        "active_dict": active_dict_path,
+        "engine_stamp": _file_stamp(engine_path),
+        "dict_stamp": _file_stamp(active_dict_path),
+    }
+
+
 def _trim_log_file(path):
-    """防止日志文件长期追加无限膨胀：超过 MAX_LOG_BYTES 时截断保留尾部 KEEP_LOG_BYTES。"""
+    """兼容旧版 stdout 重定向模式：启动时若日志超过 MAX_LOG_BYTES 则截断保留尾部。"""
     try:
         if path.exists() and path.stat().st_size > MAX_LOG_BYTES:
             data = path.read_bytes()[-KEEP_LOG_BYTES:]
@@ -641,6 +711,29 @@ def _trim_log_file(path):
             path.write_bytes(data)
     except OSError:
         pass
+
+
+def _setup_rotating_logger(log_path):
+    """配置运行期自动轮转的文件日志器（超过 MAX_LOG_BYTES 自动滚动，保留 1 份旧日志）。"""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("antigravity_zh")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+    handler = RotatingFileHandler(
+        str(log_path),
+        maxBytes=MAX_LOG_BYTES,
+        backupCount=1,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    return logger, handler
 
 
 # ============================================================
@@ -662,25 +755,30 @@ def main():
     ap.add_argument("--once", action="store_true", help="只注入一次后退出")
     ap.add_argument("--no-metrics", action="store_true", help="仅启用界面汉化，彻底禁用小组件挂载与本地日志读取")
     ap.add_argument("--metrics-only", action="store_true", help="仅启用上下文/Token 速度小组件，保持原始英文界面")
-    ap.add_argument("--log", help="把输出同时追加到该文件")
+    ap.add_argument("--log", help="将运行日志写入指定文件（自动按大小轮转）")
     args = ap.parse_args()
     if args.no_metrics and args.metrics_only:
         print("❌ --no-metrics 与 --metrics-only 不能同时指定")
         return 1
 
-    # 若以 LaunchAgent 运行，启动时也顺手检查默认 translate.log 大小
-    _trim_log_file(SCRIPT_DIR / "translate.log")
-    logf = None
+    file_logger = None
+    file_handler = None
     if args.log:
         log_path = Path(args.log).expanduser()
-        _trim_log_file(log_path)
-        logf = open(log_path, "a", encoding="utf-8", buffering=1)
+        file_logger, file_handler = _setup_rotating_logger(log_path)
+    else:
+        # 兼容旧版直接重定向 stdout 到 translate.log 的部署
+        _trim_log_file(SCRIPT_DIR / "translate.log")
 
     def say(msg):
         line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}" if msg else ""
-        print(line)
-        if logf:
-            logf.write(line + "\n")
+        if sys.stdout and not sys.stdout.closed:
+            try:
+                print(line)
+            except OSError:
+                pass
+        if file_logger:
+            file_logger.info(line)
 
     engine_path = Path(args.engine)
     if not engine_path.is_absolute():
@@ -709,41 +807,14 @@ def main():
                 pass
         return dict_path
 
-    def file_stamp(p):
-        try:
-            st = p.stat()
-            return (st.st_mtime_ns, st.st_size)
-        except OSError:
-            return None
-
     def load_bundle():
         active_dict = resolve_active_dict_path()
-        raw_dict = json.loads(active_dict.read_text(encoding="utf-8"))
-        raw_dict.pop("_meta", None)
-        dict_json = json.dumps(raw_dict, ensure_ascii=False, separators=(",", ":"))
-        init_zh = "false" if args.metrics_only else "true"
-        init_hud = "false" if args.no_metrics else "true"
-        src_text = engine_path.read_text(encoding="utf-8")
-        if "%%DICT%%" not in src_text:
-            raise ValueError(f"{engine_path.name} 缺少 %%DICT%% 占位符")
-        sig_seed = f"{dict_json}|zh={init_zh}|hud={init_hud}|{hashlib.sha256(src_text.encode('utf-8')).hexdigest()[:12]}".encode("utf-8")
-        dict_sig = hashlib.sha256(sig_seed).hexdigest()[:8]
-        built = (
-            src_text
-            .replace("%%DICT_SIG%%", dict_sig)
-            .replace("%%INIT_ZH%%", init_zh)
-            .replace("%%INIT_HUD%%", init_hud)
-            .replace("%%DICT%%", dict_json)
+        return build_injection_bundle(
+            engine_path,
+            active_dict,
+            metrics_only=args.metrics_only,
+            no_metrics=args.no_metrics,
         )
-        return {
-            "script": built,
-            "entries_count": len(raw_dict),
-            "want_ver": engine_version(built),
-            "dict_sig": dict_sig,
-            "active_dict": active_dict,
-            "engine_stamp": file_stamp(engine_path),
-            "dict_stamp": file_stamp(active_dict),
-        }
 
     try:
         bundle = load_bundle()
@@ -795,8 +866,8 @@ def main():
                     cur_dict_path = resolve_active_dict_path()
                     if (
                         cur_dict_path != bundle["active_dict"]
-                        or file_stamp(cur_dict_path) != bundle["dict_stamp"]
-                        or file_stamp(engine_path) != bundle["engine_stamp"]
+                        or _file_stamp(cur_dict_path) != bundle["dict_stamp"]
+                        or _file_stamp(engine_path) != bundle["engine_stamp"]
                     ):
                         try:
                             new_bundle = load_bundle()
@@ -861,7 +932,7 @@ def main():
                     doc = info.get("doc")
                     cur_ver = info.get("version")
                     cur_dict_sig = info.get("dictSig")
-                    same_bundle = (cur_ver == want_ver) and (not cur_dict_sig or cur_dict_sig == want_dict_sig)
+                    same_bundle = (cur_ver == want_ver) and (cur_dict_sig == want_dict_sig)
 
                     # 同一文档 + 引擎在跑 + 版本与词典签名一致 → 仅按需增量推送上下文与速度指标
                     if info.get("engine") and doc_ids.get(tid) == doc and same_bundle:
@@ -933,8 +1004,11 @@ def main():
                 time.sleep(POLL_INTERVAL)
     finally:
         _WS_POOL.clear()
-        if logf:
-            logf.close()
+        if file_handler:
+            try:
+                file_handler.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

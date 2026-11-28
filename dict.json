@@ -1,8 +1,8 @@
 {
   "_meta": {
-    "version": "2.3.0",
+    "version": "2.3.1",
     "target": "Antigravity 2.34.0",
-    "last_updated": "2026-11-27"
+    "last_updated": "2026-11-28"
   },
   "New Conversation": "新建对话",
   "New conversation": "新建对话",
@@ -10,7 +10,6 @@
   "Scheduled Tasks": "定时任务",
   "Scheduled tasks": "定时任务",
   "Skills & Customizations": "技能与定制",
-  "Skills &amp; Customizations": "技能与定制",
   "Settings": "设置",
   "settings": "设置",
   "Chat": "对话",
@@ -83,7 +82,7 @@
   "Project-Level Settings": "项目级设置",
   "always-proceed": "始终执行",
   "Always proceed": "始终执行",
-  "request-review": "请求审核",
+  "request-review": "请求审查",
   "Request review": "请求审查",
   "strict": "严格模式",
   "Strict": "严格模式",
@@ -529,7 +528,6 @@
   "Strong": "强",
   "Default Light": "默认浅色",
   "Default Dark": "默认深色",
-  "Models &amp; Usage": "模型与用量",
   "You have used some of your weekly limit, it will fully refresh in": "你已使用了部分每周额度，将在",
   "You have used some of your 5-hour limit, it will fully refresh in": "你已使用了部分五小时额度，将在",
   "Browser settings have moved to the Browser section of General settings.": "浏览器设置已迁移至通用设置的浏览器部分。",
@@ -1934,5 +1932,11 @@
   "Automatically migrate legacy workflows to modern skills across global and workspace configurations. Scans for existing workflows, creates target SKILL.md files, and safely archives old workflow files.": "自动将旧版工作流迁移为新版技能（SKILL.md），并安全归档旧工作流文件。",
   "How to manage and create plugins — namespaced bundles of skills, agents, rules, MCP servers and hooks that install, enable and disable as a single unit. Use this skill when the user wants to enable, disable, install or uninstall a plugin, when they want to create a new plugin, or when a new customization should be packaged into a plugin rather than left loose. Also triggered by the /plugin slash command. Don't use for the underlying customization system itself — discovery roots, loading priority, or authoring a standalone skill, agent, rule, hook or MCP server outside a plugin; see the customizations guide skill for those.": "管理和创建插件（将技能、智能体、规则、MCP 服务器与钩子打包为可一键启停的组合包）。",
   "How to write and run a dynamic workflow script with the `run_workflow` tool: a Python script that orchestrates many agents with `agent`, `parallel`, `pipeline`, and `phase`. Use when a task splits into many independent or staged pieces of agent work (fan out over files, modules, bugs, or review angles, then aggregate), or when the user asks for a workflow. Don't use for a single delegated task (use a subagent) or for legacy workflow files (see migrate-workflows).": "编写并运行动态工作流脚本（run_workflow），用 Python 编排多智能体并行或分阶段协作。",
-  "Discover UI plugin panels relevant to the current task and surface a one-click pill in chat to open (toggle) them in the side pane. Use when a running UI plugin's panel would help with what the user is doing, or right after the user enables a new UI plugin pane and a shortcut to open it is handy.": "发现与当前任务相关的界面插件面板，并在对话中提供一键打开侧边面板的快捷入口。"
+  "Discover UI plugin panels relevant to the current task and surface a one-click pill in chat to open (toggle) them in the side pane. Use when a running UI plugin's panel would help with what the user is doing, or right after the user enables a new UI plugin pane and a shortcut to open it is handy.": "发现与当前任务相关的界面插件面板，并在对话中提供一键打开侧边面板的快捷入口。",
+  "Applies to /btw and messages sent after this turn": "适用于 /btw 及本轮之后发送的消息",
+  "Applies to /btw and messages sent after this turn.": "适用于 /btw 及本轮之后发送的消息。",
+  "Record Audio": "录制语音",
+  "Permissions cannot be changed while the agent is running": "智能体运行期间无法更改权限",
+  "Permissions cannot be changed while the agent is running.": "智能体运行期间无法更改权限。",
+  "Edit Conversation Title": "编辑对话标题"
 }

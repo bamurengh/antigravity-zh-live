@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Antigravity 汉化 v0.3.2 — 一键安装 / 同步部署到 LaunchAgent
+# Antigravity 汉化 v0.3.3 — 一键安装 / 同步部署到 LaunchAgent
 # ==============================================================
 # 支持两种场景：
 #   · 全新 Mac（首次迁移）：自动创建 ~/.antigravity-zh 与 LaunchAgent 开机自启服务
@@ -98,26 +98,29 @@ else:
         "Label": label,
         "RunAtLoad": True,
         "KeepAlive": True,
-        "StandardOutPath": str(dst / "translate.log"),
-        "StandardErrorPath": str(dst / "translate.log"),
     }
-prog = [py_bin, str(dst / "run_observer_plus.py")]
+prog = [py_bin, str(dst / "run_observer_plus.py"), "--log", str(dst / "translate.log")]
 if extra_flag:
     prog.append(extra_flag)
 data["ProgramArguments"] = prog
-data["StandardOutPath"] = str(dst / "translate.log")
-data["StandardErrorPath"] = str(dst / "translate.log")
+# 正常日志由 Python RotatingFileHandler 自动按大小轮转写入 translate.log；
+# StandardErrorPath 仅用于兜底捕获 Python 未捕获异常或启动期错误。
+data["StandardOutPath"] = "/dev/null"
+data["StandardErrorPath"] = str(dst / "translate.err.log")
 plist.write_bytes(plistlib.dumps(data))
 print(" plist 已就绪 →", " ".join(data["ProgramArguments"]))
 PY
 
 # ── 4) 启动 / 重启 LaunchAgent ──
 U="$(id -u)"
+PROC_PATTERN="antigravity-zh/run_observer_plus\.py"
+LAUNCH_FAILED=0
 launchctl bootout "gui/$U/$LABEL" 2>/dev/null || true
 sleep 1
 ERR_FILE="$(mktemp)"
 if ! launchctl bootstrap "gui/$U" "$PLIST" 2>"$ERR_FILE"; then
   if ! launchctl load -w "$PLIST" 2>>"$ERR_FILE"; then
+    LAUNCH_FAILED=1
     echo " ⚠️ launchctl 启动返回错误："
     sed 's/^/    /' "$ERR_FILE" | head -n 5
   fi
@@ -127,11 +130,22 @@ sleep 3
 
 echo "════════════════════════════════════════════════════"
 echo " 进程状态："
-pgrep -fl "antigravity-zh/" || echo "  ⚠️ 未见进程（如首次运行，请确认系统设置 → 通用 → 登录项允许后台运行）"
+if pgrep -fl "$PROC_PATTERN"; then
+  echo "on" > "$SRC/.agyzh-state" 2>/dev/null || true
+else
+  LAUNCH_FAILED=1
+  echo "  ⚠️ 未见进程（如首次运行，请确认系统设置 → 通用 → 登录项允许后台运行）"
+fi
 echo
 echo " 日志尾部："
 tail -12 "$DST/translate.log" 2>/dev/null || echo "  （暂无日志）"
+if [ -s "$DST/translate.err.log" ]; then
+  echo
+  echo " 错误日志尾部（translate.err.log）："
+  tail -6 "$DST/translate.err.log" 2>/dev/null || true
+fi
 echo
 echo " 如需恢复旧版本，可直接从备份目录拷回："
 echo "   $BK"
 echo "════════════════════════════════════════════════════"
+exit "$LAUNCH_FAILED"

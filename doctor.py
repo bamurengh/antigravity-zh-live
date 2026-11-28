@@ -2,8 +2,7 @@
 """
 Antigravity 汉化 — 健康诊断工具（doctor）
 ==========================================
-纯粹的新增文件：不修改 translate.py / observer.js / dict.json，也不改动
-Antigravity 的任何状态。默认只读（唯一的写操作是引擎自身的开关，需显式指定）。
+只读体检工具：不修改任何脚本、词典或 Antigravity 的运行状态。
 
 用法:
     python3 doctor.py              # 完整体检（只读）
@@ -15,7 +14,7 @@ Antigravity 的任何状态。默认只读（唯一的写操作是引擎自身�
     [3] 调试端口      DevToolsActivePort 是否可读（macOS TCC 常见故障点）
     [4] CDP HTTP      /json/version、/json/list 是否可达
     [5] CDP WebSocket 握手是否成功（只握手、不注入）
-    [6] 资源文件      dict.json 结构、observer.js / observer_plus.js 是否就绪
+    [6] 资源文件      dict.json 结构、observer_plus.js 是否就绪
     [7] 注入状态      页面是否已注入、用的哪个引擎、开关状态
     [8] 覆盖率        实时的中文/英文 UI 串统计，量化「翻不全」的程度
 """
@@ -118,9 +117,17 @@ class MiniWS:
         out, self._buf = self._buf[:n], self._buf[n:]
         return out
 
-    def send(self, text):
-        data = text.encode("utf-8")
-        frame = bytearray([0x81])
+    @staticmethod
+    def _mask_bytes(data, mask):
+        """利用大整数位运算对整段载荷高速异或掩码（纯标准库，较逐字节循环快数十倍）。"""
+        n = len(data)
+        if not n:
+            return b""
+        rep = (mask * ((n + 3) // 4))[:n]
+        return (int.from_bytes(data, "big") ^ int.from_bytes(rep, "big")).to_bytes(n, "big")
+
+    def _send_frame(self, opcode, data):
+        frame = bytearray([0x80 | opcode])
         n = len(data)
         if n < 126:
             frame.append(0x80 | n)
@@ -132,12 +139,17 @@ class MiniWS:
             frame.extend(struct.pack(">Q", n))
         mask = os.urandom(4)
         frame.extend(mask)
-        frame.extend(bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+        if n:
+            frame.extend(self._mask_bytes(data, mask))
         self.sock.sendall(bytes(frame))
 
+    def send(self, text):
+        self._send_frame(0x1, text.encode("utf-8"))
+
     def recv_text(self):
-        """收完整的一条文本消息：跳过 ping/pong，拼接分片，忽略二进制。"""
-        payload = b""
+        """收完整的一条文本消息：规范回显 ping→pong，拼接分片，真正跳过二进制消息。"""
+        payload = bytearray()
+        in_binary = False
         while True:
             b0, b1 = self._read(2)
             fin = b0 & 0x80
@@ -150,19 +162,30 @@ class MiniWS:
                 length = struct.unpack(">Q", self._read(8))[0]
             mask = self._read(4) if masked else None
             data = self._read(length)
-            if mask:
-                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-            if opcode == 0x9:                      # ping → pong
-                self.sock.sendall(bytes([0x8A, 0x80]) + os.urandom(4))
+            if mask and data:
+                data = self._mask_bytes(data, mask)
+            if opcode == 0x9:                      # ping → 按 RFC 6455 回显载荷的 pong
+                self._send_frame(0xA, data[:125])
                 continue
             if opcode == 0xA:                      # pong
                 continue
             if opcode == 0x8:                      # close
                 return None
-            if opcode in (0x1, 0x2):               # text / binary
-                payload = data
+            if opcode == 0x2:                      # binary → 丢弃并跳过后续分片
+                in_binary = not fin
+                payload.clear()
+                continue
+            if opcode == 0x1:                      # text
+                in_binary = False
+                payload = bytearray(data)
             elif opcode == 0x0:                    # continuation
-                payload += data
+                if in_binary:
+                    if fin:
+                        in_binary = False
+                    continue
+                payload.extend(data)
+            else:
+                continue
             if fin:
                 return payload.decode("utf-8", errors="replace")
 
@@ -289,16 +312,22 @@ def read_port_file(rep):
 def cdp_http(rep, port):
     rep.section("4. CDP HTTP 接口")
     for path in ("/json/version", "/json/list"):
+        conn = None
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=4)
             conn.request("GET", path)
             resp = conn.getresponse()
             raw = resp.read()
-            conn.close()
         except Exception as e:
             rep.add("fail", f"GET {path} 失败", f"{type(e).__name__}: {e}",
                     fix="确认 Antigravity 仍在运行，且端口未被防火墙/其它进程占用。")
             return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         if path == "/json/version":
             try:
                 info = json.loads(raw)
@@ -337,7 +366,7 @@ def cdp_ws(rep, port, pages):
         ws = MiniWS("127.0.0.1", port, f"/devtools/page/{tid}")
     except Exception as e:
         rep.add("fail", "WebSocket 握手失败", f"{type(e).__name__}: {e}",
-                fix="这是 translate.py 注入失败的直接原因。重试并确认端口来自 Antigravity。")
+                fix="这是 run_observer_plus.py 注入失败的直接原因。重试并确认端口来自 Antigravity。")
         return None
     rep.add("ok", "WebSocket 握手成功", f"/devtools/page/{tid} ({(main_page.get('title') or '')[:50]})")
     return ws

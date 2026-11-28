@@ -29,14 +29,19 @@ if pgrep -x "$APP" >/dev/null 2>&1; then
   fi
 fi
 
+# Antigravity 已不在运行：若存在崩溃残留的旧端口文件，先清理以免误判为新启动成功
+if [ -f "$PORT_FILE" ]; then
+  rm -f "$PORT_FILE" 2>/dev/null || true
+fi
+
 echo "▶ 以汉化模式启动 Antigravity…"
 open -a "$APP" --args --remote-debugging-port=0
 
 for _ in $(seq 1 20); do
-  [ -f "$PORT_FILE" ] && break
+  [ -s "$PORT_FILE" ] && break
   sleep 1
 done
-if [ -f "$PORT_FILE" ]; then
+if [ -s "$PORT_FILE" ]; then
   echo "✅ 调试端口已开启，后台注入器会在几秒内自动完成汉化。"
 else
   echo "⚠️ 未检测到 DevToolsActivePort，请稍后再试或查看 ~/.antigravity-zh/translate.log"

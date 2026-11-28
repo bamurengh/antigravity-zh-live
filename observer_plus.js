@@ -1,27 +1,20 @@
 /**
- * Antigravity 汉化 — DOM 翻译引擎（增强版 / 非侵入修补件）
- * =========================================================
- * 本文件是 observer.js 的「可替换增强版」，按与原版完全相同的方式被注入：
- *     translate.py 读取本文件 → 把 %%DICT%% 换成 dict.json 的内容 → Runtime.evaluate
- * 它不修改、不依赖任何原文件，也不改动 dict.json 的任何数据。
+ * Antigravity 汉化 — DOM 翻译引擎与遥测 HUD（observer_plus.js）
+ * ============================================================
+ * 由 run_observer_plus.py 读取本文件，将词典占位符替换为 dict.json 内容，
+ * 并通过本机 CDP Runtime.evaluate 注入页面运行。不修改 Antigravity 任何安装文件。
  *
- * 相对原版 observer.js 修补的 4 个缺陷：
- *   ① 动态文案不支持      原版只做「整串精确匹配」，任何带数字/变量的文案都翻不了
- *                         （如 "Worked for 42s"）。本版增加「按词切分的贪心最长匹配」，
- *                         且要求整串被完全消费，绝不产出中英混杂的结果。
- *   ② 属性变化不监听      原版 observe() 未声明 attributes，React 动态改
- *                         placeholder/aria-label 后永不重译。本版加 attributeFilter。
- *   ③ 元素级标记过粗      原版用 el[MARK] 一票否决整个元素，属性再也无法重译。
- *                         本版用 WeakMap 记录「英文原值」，既能识别我方写入、
- *                         防止自触发死循环，又能在应用改回英文时重新翻译。
- *   ④ 无法停用/无法观测   原版没有开关也不暴露状态。本版支持
- *                         window.__agy_zh_enabled 开关，并暴露只读的
- *                         window.__agy_dict / __agy_zh_stats 供外部审计。
+ * 核心能力：
+ *   ① 动态文案与短语切分   精确匹配 + 大小写兜底 + 正则模式 + 严格短语切分，不产中英混杂。
+ *   ② 属性变化自动重译     监听 placeholder / title / aria-label / data-tooltip 变更。
+ *   ③ WeakMap 防自触发     记录我方写入值与英文原值，支持免刷新中英切换与重译。
+ *   ④ 代码块与富文本保护   TreeWalker 子树剪枝 + 祖先链防护，绝不误翻高亮代码 token。
+ *   ⑤ 内嵌遥测小组件       Shadow DOM 隔离的上下文窗口占用与 Token 速度 HUD。
  *
- * 与原版的兼容契约（严格保持不变）：
- *   · 注入占位符  %%DICT%%
+ * 注入契约：
+ *   · 词典占位符  位于文件末尾 IIFE 调用参数
  *   · 幂等标记    window.__agy_zh_injected
- *   · 跳过        script/style/code/pre/textarea/svg、language-* 代码块、路径、URL
+ *   · 跳过保护    script/style/code/pre/svg/kbd/samp、language-* 代码块、编辑器文本、路径与 URL
  */
 
 (function(DICT) {
@@ -34,6 +27,8 @@
                 (prev && prev.engine ? prev.engine : '未知'));
     return;
   }
+  // 热升级前记录用户的中英开关状态，避免热重载把用户手动切到 EN 的页面强行切回中文
+  var prevZhFlag = (typeof window.__agy_zh_flag === 'boolean') ? window.__agy_zh_flag : null;
   // 若页面里已有一个「旧版引擎实例」在跑，先把它的回调/监听停掉。
   // 否则热升级后两个实例并存：旧实例的闭包不认新标记，会继续按老规则改写文本，
   // 导致「切回英文」时部分内容被它重新翻回中文。
@@ -93,23 +88,31 @@
     dictKeys = Object.keys(dict);
   })();
 
-  // 只读暴露，供 doctor.py / agyctl.py 审计覆盖率（不参与翻译决策）
+  // 只读暴露，供 doctor.py 审计覆盖率（不参与翻译决策）
   try { window.__agy_dict = dict; } catch (e) {}
 
   // ====== 常量 ======
-  var ENGINE_VERSION = '0.3.2';          // 引擎版本：语义变化时递增，供注入器判断是否需要热替换
+  var ENGINE_VERSION = '0.3.3';          // 引擎版本：语义变化时递增，供注入器判断是否需要热替换
   var DICT_SIG = '%%DICT_SIG%%';         // 词典签名：词典热重载时变更，供注入器判断热替换
   var INIT_ZH = '%%INIT_ZH%%' !== 'false';
   var INIT_HUD = '%%INIT_HUD%%' !== 'false';
+  var MODEL_LIMITS_CFG = %%MODEL_LIMITS%%;
   var MARK = typeof Symbol === 'function' ? Symbol('zh') : '__zh_mark__';
   var TR_ATTRS = ['placeholder', 'title', 'aria-label', 'data-tooltip'];
   // 极短高歧义词：只有作为元素内唯一文本（不含相邻拆句节点、不带前后空格拼接）时才允许翻译，
   // 避免 React 拆句（如 "No " + "automations" + " yet"）被误翻成 "否 自动化任务 yet"。
   var AMBIGUOUS_SHORT = { No: 1, Yes: 1, On: 1, Off: 1, In: 1, Or: 1, To: 1 };
+  // 整棵子树跳过（既不翻文本也不翻属性，用于 TreeWalker 直接 FILTER_REJECT 剪枝）
+  var PRUNE_TAGS = {
+    SCRIPT: 1, STYLE: 1, CODE: 1, PRE: 1, SVG: 1, KBD: 1, SAMP: 1
+  };
+  // 文本跳过标签（包含表单控件：跳过其内部文本，但允许翻译其自身 placeholder / aria-label）
   var SKIP_TAGS = {
     SCRIPT: 1, STYLE: 1, CODE: 1, PRE: 1, TEXTAREA: 1, SVG: 1,
     INPUT: 1, SELECT: 1, OPTION: 1, KBD: 1, SAMP: 1
   };
+  var PRUNE_ANCESTOR_SEL = '#__agy_metrics_host, code, pre, svg, script, style, kbd, samp, [class*="language-"]';
+  var SKIP_TEXT_ANCESTOR_SEL = '#__agy_metrics_host, code, pre, svg, textarea, [contenteditable="true"], [class*="language-"]';
   var HAS_WEAKMAP = typeof WeakMap === 'function';
   var HAS_WEAKSET = typeof WeakSet === 'function';
 
@@ -131,6 +134,14 @@
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(t)) return true;
     return false;
   }
+  function isPrunableElement(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.id === '__agy_metrics_host') return true;
+    if (PRUNE_TAGS[el.tagName]) return true;
+    var cls = el.className;
+    if (typeof cls === 'string' && cls.indexOf('language-') !== -1) return true;
+    return false;
+  }
   function isSkippableParent(el) {
     if (!el) return true;
     if (el.id === '__agy_metrics_host') return true;
@@ -138,6 +149,9 @@
     var cls = el.className;
     if (typeof cls === 'string' && cls.indexOf('language-') !== -1) return true;
     if (el.isContentEditable) return true;
+    try {
+      if (el.closest && el.closest(SKIP_TEXT_ANCESTOR_SEL)) return true;
+    } catch (e) {}
     return false;
   }
 
@@ -537,6 +551,10 @@
   // ====== 元素属性 ======
   function processElementAttrs(el) {
     if (!el || el.nodeType !== 1 || !el.getAttribute) return;
+    if (isPrunableElement(el)) return;
+    try {
+      if (el.closest && el.closest(PRUNE_ANCESTOR_SEL)) return;
+    } catch (e) {}
     for (var i = 0; i < TR_ATTRS.length; i++) {
       var name = TR_ATTRS[i];
       var val = el.getAttribute(name);
@@ -565,6 +583,24 @@
     }
   }
 
+  // ====== 剪枝遍历器：整棵跳过代码块、SVG 与小组件，减少遍历开销并杜绝代码 token 误翻 ======
+  var PRUNE_NODE_FILTER = {
+    acceptNode: function(node) {
+      if (node.nodeType === 1 && isPrunableElement(node)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  };
+  function createPrunedWalker(root) {
+    return document.createTreeWalker(
+      root,
+      NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+      PRUNE_NODE_FILTER,
+      false
+    );
+  }
+
   // ====== 修复旧引擎遗留的「中文 空格 中文」 ======
   // 早期版本会把 "Conversation History" 渲染成「对话 历史」；那些节点已被旧引擎
   // 标记、内容也不再变化，新引擎不会重新处理它们。这里做一次遍历把词间空格抹掉。
@@ -572,9 +608,10 @@
   var CJK_SPACE_RE = /([\u4e00-\u9fa5])[ \t\u00a0]+(?=[\u4e00-\u9fa5])/g;
   function repairCjkSpacing() {
     if (!document.body) return 0;
-    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+    var walker = createPrunedWalker(document.body);
     var n, fixed = 0;
     while ((n = walker.nextNode())) {
+      if (n.nodeType !== 3) continue;
       if (isSkippableParent(n.parentElement)) continue;
       var t = n.textContent || '';
       if (t.indexOf(' ') === -1 && t.indexOf('\t') === -1 && t.indexOf('\u00a0') === -1) continue;
@@ -589,23 +626,18 @@
     if (!root) return;
     if (root.nodeType === 3) { processTextNode(root); return; }
     if (root.nodeType !== 1 && root.nodeType !== 11) return;
-    if (root.nodeType === 1 && SKIP_TAGS[root.tagName]) return;
+    if (root.nodeType === 1 && isPrunableElement(root)) return;
 
     if (root.nodeType === 1) processElementAttrs(root);
 
-    var walker = document.createTreeWalker(
-      root,
-      NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
-      null,
-      false
-    );
+    var walker = createPrunedWalker(root);
     var n, scanned = 0;
     while ((n = walker.nextNode())) {
       if (window.__agy_zh_enabled === false) return;
       if (++scanned > CFG.maxScanNodes) break;
       if (deadline && (scanned & 255) === 0 && Date.now() > deadline) break;
       if (n.nodeType === 3) processTextNode(n);
-      else if (!SKIP_TAGS[n.tagName]) processElementAttrs(n);
+      else processElementAttrs(n);
     }
   }
 
@@ -694,6 +726,7 @@
   var hudObservedRow = null;
   var hudAvailWidth = 999;
   var lastHudRenderKey = '';
+  var lastPopRenderKey = '';
   var hudDocClickHandler = null;
   var hudKeyHandler = null;
   var hudVisHandler = null;
@@ -702,6 +735,7 @@
   var domDirty = true;
   var lastRescanAt = 0;
   var lastPruneAt = 0;
+  var rescanWalker = null;
 
   // DOM 流式输出实时测速状态
   var streamEvents = []; // [{t, tok}]
@@ -801,7 +835,7 @@
         var permBtn = document.querySelector('[data-testid="permissions-selector-trigger"]');
         if (permBtn && permBtn.isConnected) {
           var pAria = (permBtn.getAttribute('aria-label') || '') + ' ' + ((attrOrigins && attrOrigins.get(permBtn) && attrOrigins.get(permBtn)['aria-label']) || '');
-          if (permBtn.disabled || permBtn.getAttribute('aria-disabled') === 'true' || /while the agent is running/i.test(pAria)) {
+          if (permBtn.disabled || permBtn.getAttribute('aria-disabled') === 'true' || /while the agent is running|智能体运行期间/i.test(pAria)) {
             working = true;
           }
         }
@@ -914,11 +948,11 @@
 
   function inferLimitFromModelText(name) {
     var s = String(name || '').toLowerCase();
-    if (s.indexOf('claude') !== -1) return 200000;
-    if (s.indexOf('flash') !== -1) return 256000;
-    if (s.indexOf('gpt') !== -1) return 272000;
-    if (s.indexOf('neon') !== -1) return 512000;
-    return 1000000;
+    var rules = (MODEL_LIMITS_CFG && MODEL_LIMITS_CFG.rules) || [];
+    for (var i = 0; i < rules.length; i++) {
+      if (s.indexOf(rules[i][0]) !== -1) return rules[i][1];
+    }
+    return (MODEL_LIMITS_CFG && MODEL_LIMITS_CFG.defaultLimit) || 1000000;
   }
 
   function inferAnchorModelInfo() {
@@ -1268,7 +1302,7 @@
       '.wrap.light .cap-row{border-top-color:rgba(15,23,42,0.07);}' +
       '.cap-label{opacity:.65;}' +
       '.cap-group{display:flex;gap:3px;}' +
-      '.cap-btn{border:1px solid transparent;background:transparent;color:inherit;opacity:.72;border-radius:5px;padding:1.5px 6px;font-size:10px;cursor:pointer;transition:all .12s;}' +
+      '.cap-btn{border:1px solid transparent;background:transparent;color:inherit;opacity:.72;border-radius:5px;padding:1.5px 5px;font-size:10px;cursor:pointer;transition:all .12s;}' +
       '.cap-btn:hover{opacity:1;background:rgba(148,163,184,0.12);}' +
       '.cap-btn.active{opacity:1;background:#f3f4f6;color:#111827;font-weight:600;}' +
       '.wrap.light .cap-btn.active{background:#111827;color:#ffffff;}' +
@@ -1552,84 +1586,101 @@
         : null);
     var idleTps = m ? (m.lastTurnAvgTps || m.avgTps || m.lastTps) : null;
 
-    var renderKey = [
+    var zhOn = window.__agy_zh_enabled !== false;
+    var chipRenderKey = [
       isDark ? 1 : 0, hudExpanded ? 1 : 0, mode,
       m ? m.convId : '', m ? m.updatedAt : 0,
       ctxTok, limit, isWorking ? 1 : 0, liveTps, idleTps,
-      window.__agy_zh_enabled !== false ? 1 : 0
+      zhOn ? 1 : 0
     ].join('|');
-    if (renderKey === lastHudRenderKey && !hudExpanded) return;
-    lastHudRenderKey = renderKey;
 
-    if (ring) {
-      var circ = 2 * Math.PI * 5.5;
-      var offset = circ * (1 - Math.min(1, pct / 100));
-      var ringStroke = !m ? '#94a3b8' : (pct >= 85 ? '#ef4444' : (pct >= 65 ? '#f59e0b' : (isDark ? '#60a5fa' : '#2563eb')));
-      ring.setAttribute('stroke', ringStroke);
-      ring.setAttribute('stroke-dasharray', circ.toFixed(2));
-      ring.setAttribute('stroke-dashoffset', offset.toFixed(2));
-    }
+    if (chipRenderKey !== lastHudRenderKey) {
+      lastHudRenderKey = chipRenderKey;
 
-    var midDot = hudShadow.querySelector ? hudShadow.querySelector('.mid-dot') : null;
-    var showSpd = (mode === 'full' || mode === 'compact');
+      if (ring) {
+        var circ = 2 * Math.PI * 5.5;
+        var offset = circ * (1 - Math.min(1, pct / 100));
+        var ringStroke = !m ? '#94a3b8' : (pct >= 85 ? '#ef4444' : (pct >= 65 ? '#f59e0b' : (isDark ? '#60a5fa' : '#2563eb')));
+        ring.setAttribute('stroke', ringStroke);
+        ring.setAttribute('stroke-dasharray', circ.toFixed(2));
+        ring.setAttribute('stroke-dashoffset', offset.toFixed(2));
+      }
 
-    if (ctxText) {
-      if (mode === 'icon') {
-        ctxText.style.display = 'none';
-      } else {
-        ctxText.style.display = '';
-        if (!m) {
-          ctxText.textContent = mode === 'full' ? ('0 / ' + formatTok(limit)) : '0';
-        } else if (mode === 'full') {
-          ctxText.textContent = formatTok(ctxTok) + ' / ' + formatTok(limit) + ' (' + pctStr + ')';
+      var midDot = hudShadow.querySelector ? hudShadow.querySelector('.mid-dot') : null;
+      var showSpd = (mode === 'full' || mode === 'compact');
+
+      if (ctxText) {
+        if (mode === 'icon') {
+          ctxText.style.display = 'none';
         } else {
-          ctxText.textContent = formatTok(ctxTok) + ' (' + Math.round(pct) + '%)';
+          ctxText.style.display = '';
+          if (!m) {
+            ctxText.textContent = mode === 'full' ? ('0 / ' + formatTok(limit)) : '0';
+          } else if (mode === 'full') {
+            ctxText.textContent = formatTok(ctxTok) + ' / ' + formatTok(limit) + ' (' + pctStr + ')';
+          } else {
+            ctxText.textContent = formatTok(ctxTok) + ' (' + Math.round(pct) + '%)';
+          }
         }
       }
-    }
 
-    if (midDot) midDot.style.display = showSpd ? '' : 'none';
+      if (midDot) midDot.style.display = showSpd ? '' : 'none';
 
-    if (spdDot && spdText) {
-      if (!showSpd) {
-        spdDot.style.display = 'none';
-        spdText.style.display = 'none';
-      } else {
-        spdDot.style.display = '';
-        spdText.style.display = '';
-        if (isWorking) {
-          spdDot.className = 'dot live';
-          spdText.textContent = liveTps !== null
-            ? (mode === 'compact' ? (liveTps + ' t/s') : ('工作中 ' + liveTps + ' tok/s'))
-            : '工作中';
+      if (spdDot && spdText) {
+        if (!showSpd) {
+          spdDot.style.display = 'none';
+          spdText.style.display = 'none';
         } else {
-          spdDot.className = 'dot idle';
-          if (idleTps !== null && idleTps !== undefined) {
-            spdText.textContent = mode === 'compact'
-              ? (Math.round(idleTps) + ' t/s')
-              : ('上次平均 ' + idleTps + ' tok/s');
+          spdDot.style.display = '';
+          spdText.style.display = '';
+          if (isWorking) {
+            spdDot.className = 'dot live';
+            spdText.textContent = liveTps !== null
+              ? (mode === 'compact' ? (liveTps + ' t/s') : ('工作中 ' + liveTps + ' tok/s'))
+              : '工作中';
           } else {
-            spdText.textContent = !m ? '新对话' : '暂无测速';
+            spdDot.className = 'dot idle';
+            if (idleTps !== null && idleTps !== undefined) {
+              spdText.textContent = mode === 'compact'
+                ? (Math.round(idleTps) + ' t/s')
+                : ('上次平均 ' + idleTps + ' tok/s');
+            } else {
+              spdText.textContent = !m ? '新对话' : '暂无测速';
+            }
           }
         }
       }
     }
 
-    if (hudExpanded) positionPopover();
+    if (!hudExpanded) {
+      lastPopRenderKey = '';
+      return;
+    }
 
-    if (popBody && hudExpanded) {
-      var capBtns = [0, 1000000, 512000, 256000, 200000].map(function(val) {
+    positionPopover();
+
+    if (popBody) {
+      var popWorking = isWorking;
+      var popRenderKey = [
+        isDark ? 1 : 0, zhOn ? 1 : 0, hudCapOverride, limit,
+        popWorking ? 1 : 0, anchorModel.name,
+        m ? m.convId : '', m ? m.updatedAt : 0,
+        m ? m.modelSteps : 0, m ? m.totalOutputTokens : 0, ctxTok
+      ].join('|');
+      if (popRenderKey === lastPopRenderKey) return;
+      lastPopRenderKey = popRenderKey;
+
+      var capPresets = (MODEL_LIMITS_CFG && MODEL_LIMITS_CFG.presets) || [0, 1000000, 512000, 272000, 256000, 200000];
+      var capBtns = capPresets.map(function(val) {
         var label = val === 0 ? '自动' : formatTok(val);
         var active = hudCapOverride === val ? ' active' : '';
         return '<button class="cap-btn' + active + '" data-cap="' + val + '">' + label + '</button>';
       }).join('');
 
-      var zhOn = window.__agy_zh_enabled !== false;
       var zhBtnHtml = '<button type="button" class="zh-toggle' + (zhOn ? '' : ' en') + '" title="点击原地切换中/英文（免刷新）">' + (zhOn ? '中' : 'EN') + '</button>';
 
       if (!m) {
-        var emptyWorking = detectDomWorking();
-        var emptyBadge = emptyWorking
+        var emptyBadge = popWorking
           ? '<span class="status-tag live"><i class="dot live"></i>实时运行</span>'
           : '<span class="status-tag">新对话</span>';
         popBody.innerHTML =
@@ -1681,7 +1732,6 @@
         ? '<div class="warn-tip"><span>上下文已过半，可压缩历史释放窗口</span><button type="button" class="compact-btn">填入 /compact</button></div>'
         : '';
 
-      var popWorking = detectDomWorking() || !!m.isWorking;
       var statusBadge = popWorking
         ? '<span class="status-tag live"><i class="dot live"></i>实时运行</span>'
         : '<span class="status-tag">空闲</span>';
@@ -1803,6 +1853,7 @@
     hudAnchorBtn = null;
     hudExpanded = false;
     lastHudRenderKey = '';
+    lastPopRenderKey = '';
   }
 
   window.__agy_update_metrics = function(payload) {
@@ -1915,6 +1966,7 @@
           textSeen = HAS_WEAKSET ? new WeakSet() : null;
           textOrigin = HAS_WEAKMAP ? new WeakMap() : null;
           attrOrigin = HAS_WEAKMAP ? new WeakMap() : null;
+          rescanWalker = null;
           domDirty = true;
           observe();
           if (document.body) walkAndTranslate(document.body);
@@ -1929,18 +1981,21 @@
           textSeen = HAS_WEAKSET ? new WeakSet() : null;
           textOrigin = HAS_WEAKMAP ? new WeakMap() : null;
           attrOrigin = HAS_WEAKMAP ? new WeakMap() : null;
+          rescanWalker = null;
         }
         syncStats();
         renderHud();
       }
     });
-    window.__agy_zh_flag = INIT_ZH;
+    // 热升级时保留用户手动原地切换的 EN/中 状态（--metrics-only 模式下始终为 false）
+    window.__agy_zh_flag = INIT_ZH ? (prevZhFlag !== null ? prevZhFlag : true) : false;
   } catch (e) { /* 环境不支持时退化为始终启用 */ }
 
   // 供热升级与外部调用：断开监听并还原英文
   window.__agy_zh_uninstall = function () {
     try { observer.disconnect(); } catch (e) {}
     try { if (rescanTimer) { clearInterval(rescanTimer); rescanTimer = null; } } catch (e) {}
+    rescanWalker = null;
     destroyHud();
     return restoreEnglish();
   };
@@ -1963,7 +2018,7 @@
   }
 
   // 定时重扫：保证设置面板等动态渲染的内容被翻译
-  // 跳过 textOrigin 已记录且文本未变化的节点，并加上帧时间预算，避免长对话下阻塞主线程。
+  // 复用 processTextNode/processElementAttrs 并使用剪枝游标续扫，避免长对话超帧预算后反复从头空转。
   function rescan() {
     if (document.hidden) return;
     ensureHudMounted();
@@ -1974,58 +2029,35 @@
     }
     if (window.__agy_zh_enabled === false) return;
     if (!document.body) return;
-    // 仅在发生 DOM 变动后或超过 15 秒兜底周期时才执行扫描，空闲时零耗
-    if (!domDirty && (now - lastRescanAt) < 15000) return;
+    // 仅在存在续扫任务、发生 DOM 变动或超过 15 秒兜底周期时才执行扫描，空闲时零耗
+    if (!rescanWalker && !domDirty && (now - lastRescanAt) < 15000) return;
     domDirty = false;
     lastRescanAt = now;
     var deadline = now + CFG.budgetMs;
-    var walker = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
-      null,
-      false
-    );
-    var n, retried = 0, scanned = 0;
-    while ((n = walker.nextNode())) {
-      if (++scanned > CFG.maxScanNodes) break;
+    if (!rescanWalker || !rescanWalker.currentNode || !rescanWalker.currentNode.isConnected) {
+      rescanWalker = createPrunedWalker(document.body);
+    }
+    var n, retried = 0, scanned = 0, hitBudget = false;
+    while ((n = rescanWalker.nextNode())) {
+      if (++scanned > CFG.maxScanNodes) { hitBudget = true; break; }
       if ((scanned & 255) === 0 && Date.now() > deadline) {
-        domDirty = true;  // 超出单帧预算，下轮继续补完
+        hitBudget = true;
         break;
       }
       if (n.nodeType === 1) {
-        if (!SKIP_TAGS[n.tagName]) {
-          var beforeAttr = touchedAttr;
-          processElementAttrs(n);
-          if (touchedAttr > beforeAttr) retried++;
-        }
-        continue;
+        var beforeAttr = touchedAttr;
+        processElementAttrs(n);
+        if (touchedAttr > beforeAttr) retried++;
+      } else {
+        var beforeText = touchedText;
+        processTextNode(n);
+        if (touchedText > beforeText) retried++;
       }
-      var cur = n.textContent || '';
-      // 跳过已处理且内容未变化的节点（仅在文本真正变化后重试）
-      if (textOrigin && textOrigin.get(n) === cur) continue;
-      // 只处理含英文的、非空的文本
-      if (!cur.trim() || cur.trim().length < 2 || !/[a-zA-Z]/.test(cur)) continue;
-      var parent = n.parentElement;
-      if (isSkippableParent(parent)) continue;
-      if (parent && parent.childNodes && parent.childNodes.length > 1) {
-        if (tryTranslateSplitContainer(parent)) { retried++; continue; }
-      }
-      var trimmedCur = cur.trim();
-      if (AMBIGUOUS_SHORT[trimmedCur] && ((parent && parent.childNodes && parent.childNodes.length > 1) || cur !== trimmedCur)) {
-        continue;
-      }
-      var result = tryTranslate(cur);
-      if (result === null) result = tryCompactTime(cur, parent);
-      result = fixNewBadge(cur, trimmedCur, result, parent);
-      if (result !== null && result !== cur) {
-        if (textOrigins && !textOrigins.has(n)) textOrigins.set(n, cur);
-        n.textContent = result;
-        touchedText++;
-        if (textOrigin) textOrigin.set(n, result);
-        retried++;
-      } else if (textOrigin) {
-        textOrigin.set(n, cur);
-      }
+    }
+    if (hitBudget) {
+      domDirty = true;  // 保留 rescanWalker 游标，下轮从中断位置继续
+    } else {
+      rescanWalker = null;
     }
     if (retried) syncStats();
   }
@@ -2035,7 +2067,8 @@
     observe();
     captureExisting();          // 先登记现状（英文原文），再开始翻译
     var repaired = 0;
-    if (INIT_ZH) {
+    var startZh = window.__agy_zh_flag !== false;
+    if (startZh) {
       walkAndTranslate(document.body);
       repaired = repairCjkSpacing();
     }
@@ -2047,7 +2080,7 @@
     if (rescanTimer && typeof clearInterval === 'function') clearInterval(rescanTimer);
     if (typeof setInterval === 'function') rescanTimer = setInterval(rescan, 3000);
     console.log('[汉化] observer_plus v' + ENGINE_VERSION + ' 已激活｜词条 ' + dictKeys.length +
-                '｜汉化 ' + INIT_ZH + '｜监测 ' + INIT_HUD);
+                '｜汉化 ' + startZh + '｜监测 ' + INIT_HUD);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);

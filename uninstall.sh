@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Antigravity 汉化 v0.3.2 — 一键完整卸载脚本
+# Antigravity 汉化 v0.3.3 — 一键完整卸载脚本
 # ==========================================
 # 用法:
 #   bash uninstall.sh               # 完整卸载（默认）
@@ -37,9 +37,9 @@ if [ "$KEEP_DICT" -eq 1 ] && [ -f "$DST/dict.json" ]; then
 fi
 
 # 2) 停止并注销 LaunchAgent
-if launchctl print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || pgrep -f "antigravity-zh/" >/dev/null 2>&1; then
+if launchctl print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || pgrep -f "antigravity-zh/run_observer_plus\.py" >/dev/null 2>&1; then
   launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
-  pkill -f "antigravity-zh/run_observer_plus.py" 2>/dev/null || true
+  pkill -f "antigravity-zh/run_observer_plus\.py" 2>/dev/null || true
   echo " ✓ 已停止后台守护进程与 LaunchAgent"
 else
   echo " · 后台守护进程未运行"
